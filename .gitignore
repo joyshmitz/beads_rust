@@ -1,0 +1,18 @@
+# Build artifacts
+/target/
+
+# Cargo lock for library crates (keep for binary crates)
+# Cargo.lock
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Legacy Go reference code (not part of Rust project)
+/legacy_beads/

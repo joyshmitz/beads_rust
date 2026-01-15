@@ -310,7 +310,7 @@ When implementing new features, consult these projects for idiomatic Rust patter
 
 ## Legacy Beads Reference
 
-The original Go implementation is in `./beads/` for reference. Key directories:
+The original Go implementation is in `./legacy_beads/` for reference (gitignored). Key directories:
 
 - `internal/storage/sqlite/` — SQLite backend (PORT THIS)
 - `internal/types/` — Data models (PORT THIS)
