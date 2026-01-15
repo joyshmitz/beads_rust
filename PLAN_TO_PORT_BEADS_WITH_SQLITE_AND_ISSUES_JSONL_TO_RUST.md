@@ -1,0 +1,1110 @@
+# Plan: Port Beads (Classic SQLite + JSONL) to Rust
+
+> **Project:** beads_rust
+> **Binary Name:** `br` (to complement `bd` from Go beads and `bv` from beads_viewer)
+> **Author:** Port initiated by Jeffrey Emanuel
+> **Status:** Planning Phase
+
+---
+
+## Executive Summary
+
+This document outlines the comprehensive plan to port the "classic" beads issue tracker from Go to hyper-optimized Rust. The Go version (authored by Steve Yegge) is being modified to use Dolt as the primary backend, which fundamentally changes its architecture. This port preserves the elegant SQLite + JSONL hybrid design that integrates seamlessly with git-based workflows.
+
+### Why Port to Rust?
+
+1. **Preserve the Classic Architecture:** The SQLite + JSONL hybrid design is elegant and integrates perfectly with git. The move to Dolt changes this fundamentally.
+
+2. **Performance:** Rust's zero-cost abstractions enable significant performance improvements:
+   - Faster startup time (no Go runtime initialization)
+   - Smaller binary size (LTO + strip)
+   - Better memory efficiency (no GC pauses)
+
+3. **Consistency with Flywheel Tools:** The "agentic coding flywheel" ecosystem includes other Rust tools (xf, cass). A Rust beads will integrate more naturally.
+
+4. **Bug Fixes and Optimization:** The port provides an opportunity to fix existing bugs and apply optimization lessons learned from xf and cass.
+
+5. **Single Binary Distribution:** Rust produces truly standalone binaries with no runtime dependencies.
+
+---
+
+## Architecture Overview
+
+### What We're Porting
+
+```
+Go beads (classic)                    →    beads_rust (br)
+├── internal/storage/sqlite/          →    src/storage/
+├── internal/types/                   →    src/model/
+├── cmd/bd/                           →    src/cli/ + src/main.rs
+├── internal/export/                  →    src/export/
+├── internal/git/                     →    src/git/
+├── internal/config/                  →    src/config/
+└── internal/hooks/                   →    src/hooks/
+```
+
+### What We're NOT Porting
+
+| Component | Reason |
+|-----------|--------|
+| `internal/storage/dolt/` | The entire point of this port is to avoid Dolt |
+| `internal/rpc/` | RPC daemon adds complexity; can add later if needed |
+| `internal/linear/` | Linear integration is non-essential |
+| `internal/jira.go` | Jira integration is non-essential |
+| `claude-plugin/` | MCP plugin is separate; port core CLI first |
+
+### Reference Projects
+
+This port follows patterns from two sibling Rust CLI projects:
+
+| Project | Location | Key Patterns to Adopt |
+|---------|----------|----------------------|
+| **xf** | `/data/projects/xf` | Tantivy search, SQLite pragmas, clap derive CLI |
+| **cass** | `/data/projects/coding_agent_session_search` | Custom error types, streaming indexing, robot mode |
+
+---
+
+## Data Model
+
+### Core Types (from Go `internal/types/types.go`)
+
+The Issue struct is the heart of beads. Here's the Rust equivalent:
+
+```rust
+// src/model/issue.rs
+
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Issue {
+    // Core Identification
+    pub id: String,
+    #[serde(skip)]
+    pub content_hash: String,
+
+    // Issue Content
+    pub title: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub design: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub acceptance_criteria: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub notes: Option<String>,
+
+    // Status & Workflow
+    #[serde(default)]
+    pub status: Status,
+    pub priority: i32,  // 0-4 (P0=critical, P4=backlog)
+    #[serde(default)]
+    pub issue_type: IssueType,
+
+    // Assignment
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub assignee: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
+
+    // Timestamps
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub closed_at: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub close_reason: Option<String>,
+
+    // Labels and Dependencies (populated for export)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub labels: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dependencies: Vec<Dependency>,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Status {
+    #[default]
+    Open,
+    InProgress,
+    Blocked,
+    Deferred,
+    Closed,
+    Tombstone,
+    Pinned,
+    Hooked,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum IssueType {
+    #[default]
+    Task,
+    Bug,
+    Feature,
+    Epic,
+    Chore,
+    Message,
+    Gate,
+    Agent,
+    Role,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Dependency {
+    pub issue_id: String,
+    pub depends_on_id: String,
+    #[serde(rename = "type")]
+    pub dep_type: DependencyType,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum DependencyType {
+    Blocks,
+    ParentChild,
+    Related,
+    DiscoveredFrom,
+    RepliesTo,
+    RelatesTo,
+    Duplicates,
+    Supersedes,
+}
+```
+
+### Content Hashing
+
+Issues have deterministic content hashes for deduplication (see `ComputeContentHash` in Go):
+
+```rust
+// src/model/hash.rs
+
+use sha2::{Sha256, Digest};
+
+impl Issue {
+    pub fn compute_content_hash(&self) -> String {
+        let mut hasher = Sha256::new();
+
+        // Hash fields in stable order
+        hasher.update(self.title.as_bytes());
+        hasher.update(&[0u8]); // null separator
+
+        if let Some(desc) = &self.description {
+            hasher.update(desc.as_bytes());
+        }
+        hasher.update(&[0u8]);
+
+        hasher.update(format!("{:?}", self.status).as_bytes());
+        hasher.update(&[0u8]);
+
+        hasher.update(self.priority.to_string().as_bytes());
+        hasher.update(&[0u8]);
+
+        // ... continue for all substantive fields
+
+        format!("{:x}", hasher.finalize())
+    }
+}
+```
+
+---
+
+## Storage Layer
+
+### SQLite Backend
+
+Following the patterns from xf and cass, with pragmas optimized for the beads workload:
+
+```rust
+// src/storage/mod.rs
+
+use rusqlite::{Connection, OpenFlags};
+use std::path::Path;
+
+pub struct Storage {
+    conn: Connection,
+    path: String,
+}
+
+impl Storage {
+    pub fn open(db_path: &Path) -> Result<Self> {
+        let conn = Connection::open_with_flags(
+            db_path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE
+                | OpenFlags::SQLITE_OPEN_CREATE
+                | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+
+        // Performance pragmas (from xf)
+        conn.execute_batch("
+            PRAGMA journal_mode = WAL;
+            PRAGMA synchronous = NORMAL;
+            PRAGMA foreign_keys = ON;
+            PRAGMA cache_size = -64000;     -- 64MB cache
+            PRAGMA temp_store = MEMORY;
+            PRAGMA busy_timeout = 30000;    -- 30s lock timeout
+        ")?;
+
+        let storage = Self {
+            conn,
+            path: db_path.to_string_lossy().into_owned(),
+        };
+
+        storage.migrate()?;
+        Ok(storage)
+    }
+
+    pub fn open_readonly(db_path: &Path) -> Result<Self> {
+        let conn = Connection::open_with_flags(
+            db_path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+
+        conn.execute_batch("
+            PRAGMA cache_size = -32000;
+            PRAGMA temp_store = MEMORY;
+        ")?;
+
+        Ok(Self {
+            conn,
+            path: db_path.to_string_lossy().into_owned(),
+        })
+    }
+}
+```
+
+### Schema
+
+The schema must be compatible with Go beads for potential cross-tool usage:
+
+```sql
+-- issues table
+CREATE TABLE IF NOT EXISTS issues (
+    id TEXT PRIMARY KEY,
+    title TEXT NOT NULL,
+    description TEXT,
+    design TEXT,
+    acceptance_criteria TEXT,
+    notes TEXT,
+    status TEXT NOT NULL DEFAULT 'open',
+    priority INTEGER NOT NULL DEFAULT 2,
+    issue_type TEXT NOT NULL DEFAULT 'task',
+    assignee TEXT,
+    owner TEXT,
+    created_at TEXT NOT NULL,
+    created_by TEXT,
+    updated_at TEXT NOT NULL,
+    closed_at TEXT,
+    close_reason TEXT,
+    external_ref TEXT,
+    deleted_at TEXT,
+    delete_reason TEXT
+);
+
+-- dependencies table
+CREATE TABLE IF NOT EXISTS dependencies (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    issue_id TEXT NOT NULL,
+    depends_on_id TEXT NOT NULL,
+    type TEXT NOT NULL DEFAULT 'blocks',
+    created_at TEXT NOT NULL,
+    created_by TEXT,
+    metadata TEXT,
+    FOREIGN KEY (issue_id) REFERENCES issues(id) ON DELETE CASCADE,
+    UNIQUE(issue_id, depends_on_id, type)
+);
+
+-- labels table
+CREATE TABLE IF NOT EXISTS labels (
+    issue_id TEXT NOT NULL,
+    label TEXT NOT NULL,
+    PRIMARY KEY (issue_id, label),
+    FOREIGN KEY (issue_id) REFERENCES issues(id) ON DELETE CASCADE
+);
+
+-- events table (audit trail)
+CREATE TABLE IF NOT EXISTS events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    issue_id TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    actor TEXT,
+    old_value TEXT,
+    new_value TEXT,
+    comment TEXT,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (issue_id) REFERENCES issues(id) ON DELETE CASCADE
+);
+
+-- config table
+CREATE TABLE IF NOT EXISTS config (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+
+-- metadata table (internal state)
+CREATE TABLE IF NOT EXISTS metadata (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+
+-- dirty tracking for incremental export
+CREATE TABLE IF NOT EXISTS dirty_issues (
+    issue_id TEXT PRIMARY KEY,
+    dirty_hash TEXT,
+    FOREIGN KEY (issue_id) REFERENCES issues(id) ON DELETE CASCADE
+);
+
+-- export hash tracking
+CREATE TABLE IF NOT EXISTS export_hashes (
+    issue_id TEXT PRIMARY KEY,
+    content_hash TEXT NOT NULL,
+    FOREIGN KEY (issue_id) REFERENCES issues(id) ON DELETE CASCADE
+);
+
+-- Indexes for common queries
+CREATE INDEX IF NOT EXISTS idx_issues_status ON issues(status);
+CREATE INDEX IF NOT EXISTS idx_issues_priority ON issues(priority);
+CREATE INDEX IF NOT EXISTS idx_issues_assignee ON issues(assignee);
+CREATE INDEX IF NOT EXISTS idx_issues_type ON issues(issue_type);
+CREATE INDEX IF NOT EXISTS idx_issues_updated ON issues(updated_at);
+CREATE INDEX IF NOT EXISTS idx_dependencies_issue ON dependencies(issue_id);
+CREATE INDEX IF NOT EXISTS idx_dependencies_depends ON dependencies(depends_on_id);
+CREATE INDEX IF NOT EXISTS idx_events_issue ON events(issue_id);
+```
+
+### Migration Strategy
+
+Version-tracked migrations following the Go pattern:
+
+```rust
+// src/storage/migrations.rs
+
+const SCHEMA_VERSION: i32 = 1;
+
+impl Storage {
+    fn migrate(&self) -> Result<()> {
+        let current_version = self.get_schema_version()?;
+
+        if current_version < 1 {
+            self.migrate_v1()?;
+        }
+        // Future migrations...
+
+        self.set_schema_version(SCHEMA_VERSION)?;
+        Ok(())
+    }
+
+    fn get_schema_version(&self) -> Result<i32> {
+        match self.conn.query_row(
+            "SELECT value FROM metadata WHERE key = 'schema_version'",
+            [],
+            |row| row.get::<_, String>(0),
+        ) {
+            Ok(v) => Ok(v.parse().unwrap_or(0)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(0),
+            Err(e) => Err(e.into()),
+        }
+    }
+}
+```
+
+---
+
+## JSONL Export/Import
+
+The JSONL layer is critical for git-based sync:
+
+```rust
+// src/export/jsonl.rs
+
+use std::fs::File;
+use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::path::Path;
+
+pub fn export_issues(storage: &Storage, path: &Path) -> Result<usize> {
+    let issues = storage.get_all_issues_with_relations()?;
+    let file = File::create(path)?;
+    let mut writer = BufWriter::new(file);
+
+    let mut count = 0;
+    for issue in issues {
+        // Skip tombstones past TTL
+        if issue.is_expired_tombstone() {
+            continue;
+        }
+
+        let line = serde_json::to_string(&issue)?;
+        writeln!(writer, "{}", line)?;
+        count += 1;
+    }
+
+    writer.flush()?;
+    Ok(count)
+}
+
+pub fn import_issues(storage: &Storage, path: &Path) -> Result<ImportResult> {
+    let file = File::open(path)?;
+    let reader = BufReader::new(file);
+
+    let mut created = 0;
+    let mut updated = 0;
+    let mut skipped = 0;
+
+    for line in reader.lines() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+
+        let issue: Issue = serde_json::from_str(&line)?;
+
+        match storage.get_issue(&issue.id)? {
+            Some(existing) => {
+                if existing.updated_at < issue.updated_at {
+                    storage.update_issue_from_import(&issue)?;
+                    updated += 1;
+                } else {
+                    skipped += 1;
+                }
+            }
+            None => {
+                storage.create_issue(&issue)?;
+                created += 1;
+            }
+        }
+    }
+
+    Ok(ImportResult { created, updated, skipped })
+}
+```
+
+---
+
+## CLI Architecture
+
+### Clap Derive Pattern (from xf)
+
+```rust
+// src/cli/mod.rs
+
+use clap::{Parser, Subcommand, ValueEnum};
+use std::path::PathBuf;
+
+#[derive(Parser)]
+#[command(name = "br")]
+#[command(version = concat!(
+    env!("CARGO_PKG_VERSION"),
+    "\n  Built: ", env!("VERGEN_BUILD_TIMESTAMP"),
+    "\n  Rustc: ", env!("VERGEN_RUSTC_SEMVER"),
+))]
+#[command(about = "Beads Rust - Agent-first issue tracker (SQLite + JSONL)")]
+pub struct Cli {
+    /// Path to .beads directory
+    #[arg(long, env = "BEADS_DIR", global = true)]
+    pub beads_dir: Option<PathBuf>,
+
+    /// Output format
+    #[arg(long, short = 'f', default_value = "text", global = true)]
+    pub format: OutputFormat,
+
+    /// JSON output (shorthand for --format json)
+    #[arg(long, global = true)]
+    pub json: bool,
+
+    /// Verbose output
+    #[arg(long, short = 'v', global = true)]
+    pub verbose: bool,
+
+    /// Quiet mode (suppress non-essential output)
+    #[arg(long, short = 'q', global = true)]
+    pub quiet: bool,
+
+    #[command(subcommand)]
+    pub command: Option<Commands>,
+}
+
+#[derive(Subcommand)]
+pub enum Commands {
+    /// Initialize a new .beads directory
+    Init(InitArgs),
+
+    /// Create a new issue
+    Create(CreateArgs),
+
+    /// Update an existing issue
+    Update(UpdateArgs),
+
+    /// Close one or more issues
+    Close(CloseArgs),
+
+    /// List issues
+    List(ListArgs),
+
+    /// Show issue details
+    Show(ShowArgs),
+
+    /// Show ready work (unblocked issues)
+    Ready(ReadyArgs),
+
+    /// Show blocked issues
+    Blocked(BlockedArgs),
+
+    /// Manage dependencies
+    Dep(DepArgs),
+
+    /// Manage labels
+    Label(LabelArgs),
+
+    /// Search issues
+    Search(SearchArgs),
+
+    /// Show statistics
+    Stats(StatsArgs),
+
+    /// Sync with JSONL (export/import)
+    Sync(SyncArgs),
+
+    /// Health check and diagnostics
+    Doctor(DoctorArgs),
+
+    /// Manage configuration
+    Config(ConfigArgs),
+}
+
+#[derive(Copy, Clone, Default, ValueEnum)]
+pub enum OutputFormat {
+    #[default]
+    Text,
+    Json,
+    Jsonl,
+}
+```
+
+### Command Implementation Pattern
+
+Each command follows a consistent pattern:
+
+```rust
+// src/cli/create.rs
+
+use super::*;
+
+#[derive(Parser)]
+pub struct CreateArgs {
+    /// Issue title
+    #[arg(value_name = "TITLE")]
+    pub title: String,
+
+    /// Issue type
+    #[arg(long = "type", short = 't', default_value = "task")]
+    pub issue_type: IssueType,
+
+    /// Priority (0=critical, 4=backlog)
+    #[arg(long, short = 'p', default_value = "2")]
+    pub priority: i32,
+
+    /// Assignee
+    #[arg(long, short = 'a')]
+    pub assignee: Option<String>,
+
+    /// Labels (comma-separated)
+    #[arg(long, short = 'l', value_delimiter = ',')]
+    pub labels: Vec<String>,
+
+    /// Description (from file or stdin with -)
+    #[arg(long, short = 'd')]
+    pub description: Option<String>,
+
+    /// Parent issue (creates parent-child dependency)
+    #[arg(long)]
+    pub parent: Option<String>,
+}
+
+pub fn execute(args: &CreateArgs, ctx: &Context) -> Result<()> {
+    let storage = ctx.storage()?;
+
+    let issue = Issue {
+        id: generate_issue_id(&ctx.config.id_prefix),
+        title: args.title.clone(),
+        description: args.description.clone(),
+        status: Status::Open,
+        priority: args.priority,
+        issue_type: args.issue_type,
+        assignee: args.assignee.clone(),
+        labels: args.labels.clone(),
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+        ..Default::default()
+    };
+
+    storage.create_issue(&issue, &ctx.actor)?;
+
+    // Add parent-child dependency if specified
+    if let Some(parent_id) = &args.parent {
+        storage.add_dependency(&Dependency {
+            issue_id: issue.id.clone(),
+            depends_on_id: parent_id.clone(),
+            dep_type: DependencyType::ParentChild,
+            created_at: Utc::now(),
+        }, &ctx.actor)?;
+    }
+
+    // Mark as dirty for export
+    storage.mark_dirty(&issue.id)?;
+
+    match ctx.format {
+        OutputFormat::Json => {
+            println!("{}", serde_json::to_string_pretty(&issue)?);
+        }
+        OutputFormat::Jsonl => {
+            println!("{}", serde_json::to_string(&issue)?);
+        }
+        OutputFormat::Text => {
+            println!("Created issue: {}", issue.id);
+        }
+    }
+
+    Ok(())
+}
+```
+
+---
+
+## Error Handling
+
+### Custom Error Type (from cass pattern)
+
+```rust
+// src/error.rs
+
+use thiserror::Error;
+
+#[derive(Error, Debug)]
+pub enum BeadsError {
+    // Storage errors
+    #[error("Database error: {0}")]
+    Database(#[from] rusqlite::Error),
+
+    #[error("Issue not found: {id}")]
+    IssueNotFound { id: String },
+
+    #[error("Duplicate issue ID: {id}")]
+    DuplicateId { id: String },
+
+    // Validation errors
+    #[error("Validation error: {message}")]
+    Validation { message: String },
+
+    #[error("Invalid status: {status}")]
+    InvalidStatus { status: String },
+
+    #[error("Invalid priority: {priority} (must be 0-4)")]
+    InvalidPriority { priority: i32 },
+
+    // Dependency errors
+    #[error("Cycle detected: {path}")]
+    CycleDetected { path: String },
+
+    #[error("Dependency not found: {issue_id} -> {depends_on}")]
+    DependencyNotFound { issue_id: String, depends_on: String },
+
+    // Config errors
+    #[error("Config not found: {key}")]
+    ConfigNotFound { key: String },
+
+    #[error("Not initialized: run 'br init' first")]
+    NotInitialized,
+
+    // IO errors
+    #[error("IO error: {0}")]
+    Io(#[from] std::io::Error),
+
+    #[error("JSON error: {0}")]
+    Json(#[from] serde_json::Error),
+
+    // Context wrapper
+    #[error("{context}: {source}")]
+    WithContext {
+        context: String,
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+}
+
+pub type Result<T> = std::result::Result<T, BeadsError>;
+
+// CLI-specific error for exit codes
+#[derive(Debug)]
+pub struct CliError {
+    pub code: i32,
+    pub kind: &'static str,
+    pub message: String,
+    pub hint: Option<String>,
+}
+
+impl From<BeadsError> for CliError {
+    fn from(err: BeadsError) -> Self {
+        match &err {
+            BeadsError::IssueNotFound { .. } => CliError {
+                code: 2,
+                kind: "not_found",
+                message: err.to_string(),
+                hint: Some("Check the issue ID with 'br list'".into()),
+            },
+            BeadsError::NotInitialized => CliError {
+                code: 3,
+                kind: "not_initialized",
+                message: err.to_string(),
+                hint: Some("Run 'br init' to initialize a .beads directory".into()),
+            },
+            BeadsError::Validation { .. } => CliError {
+                code: 4,
+                kind: "validation",
+                message: err.to_string(),
+                hint: None,
+            },
+            _ => CliError {
+                code: 1,
+                kind: "error",
+                message: err.to_string(),
+                hint: None,
+            },
+        }
+    }
+}
+```
+
+---
+
+## Project Structure
+
+```
+beads_rust/
+├── Cargo.toml
+├── rust-toolchain.toml
+├── build.rs                    # Build metadata (vergen)
+├── src/
+│   ├── main.rs                 # Entry point
+│   ├── lib.rs                  # Library root
+│   ├── error.rs                # Error types
+│   ├── config.rs               # Configuration
+│   ├── model/
+│   │   ├── mod.rs
+│   │   ├── issue.rs            # Issue struct
+│   │   ├── dependency.rs       # Dependency struct
+│   │   ├── event.rs            # Event struct
+│   │   └── hash.rs             # Content hashing
+│   ├── storage/
+│   │   ├── mod.rs
+│   │   ├── schema.rs           # Schema definition
+│   │   ├── migrations.rs       # Schema migrations
+│   │   ├── issues.rs           # Issue CRUD
+│   │   ├── dependencies.rs     # Dependency operations
+│   │   ├── labels.rs           # Label operations
+│   │   ├── events.rs           # Event logging
+│   │   ├── queries.rs          # Complex queries (ready, blocked)
+│   │   └── config.rs           # Config/metadata storage
+│   ├── export/
+│   │   ├── mod.rs
+│   │   └── jsonl.rs            # JSONL export/import
+│   ├── cli/
+│   │   ├── mod.rs              # CLI definition
+│   │   ├── init.rs
+│   │   ├── create.rs
+│   │   ├── update.rs
+│   │   ├── close.rs
+│   │   ├── list.rs
+│   │   ├── show.rs
+│   │   ├── ready.rs
+│   │   ├── blocked.rs
+│   │   ├── dep.rs
+│   │   ├── label.rs
+│   │   ├── search.rs
+│   │   ├── stats.rs
+│   │   ├── sync.rs
+│   │   ├── doctor.rs
+│   │   └── config.rs
+│   ├── git/
+│   │   └── mod.rs              # Git operations
+│   └── hooks/
+│       └── mod.rs              # Hook execution
+├── tests/
+│   ├── integration_test.rs     # Full pipeline tests
+│   ├── conformance_test.rs     # bd vs br comparison tests
+│   └── cli_e2e.rs              # CLI end-to-end tests
+├── benches/
+│   └── storage_perf.rs         # Performance benchmarks
+├── beads/                      # Go reference (read-only)
+└── AGENTS.md
+```
+
+---
+
+## Cargo.toml
+
+```toml
+[package]
+name = "beads_rust"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Agent-first issue tracker (SQLite + JSONL)"
+license = "MIT"
+repository = "https://github.com/Dicklesworthstone/beads_rust"
+keywords = ["cli", "issue-tracker", "sqlite", "agent"]
+categories = ["command-line-utilities", "development-tools"]
+
+[[bin]]
+name = "br"
+path = "src/main.rs"
+
+[dependencies]
+# CLI
+clap = { version = "4.5", features = ["derive", "env"] }
+clap_complete = "4.5"
+
+# Database
+rusqlite = { version = "0.32", features = ["bundled", "modern_sqlite"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# Hashing
+sha2 = "0.10"
+
+# Error handling
+anyhow = "1.0"
+thiserror = "2.0"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Terminal
+colored = "2.1"
+indicatif = "0.17"
+
+# Utilities
+once_cell = "1.19"
+rayon = "1.10"
+
+[build-dependencies]
+vergen-gix = { version = "1.0", features = ["build", "cargo", "rustc"] }
+
+[dev-dependencies]
+tempfile = "3.10"
+assert_cmd = "2.0"
+predicates = "3.1"
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "storage_perf"
+harness = false
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[profile.dev]
+opt-level = 1
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+```
+
+---
+
+## Implementation Phases
+
+### Phase 1: Foundation (MVP)
+
+**Goal:** Basic CRUD operations that can read/write JSONL compatible with Go beads.
+
+**Deliverables:**
+- [ ] Project scaffolding (Cargo.toml, rust-toolchain.toml, src/ structure)
+- [ ] Data models (Issue, Dependency, Event, Status, IssueType)
+- [ ] Content hashing (compatible with Go implementation)
+- [ ] SQLite storage layer with schema
+- [ ] Basic migrations
+- [ ] JSONL export (issues.jsonl)
+- [ ] JSONL import
+- [ ] CLI commands: init, create, show, list
+- [ ] Error handling framework
+
+**Validation:** Run `br list --json` and `bd list --json` on the same .beads directory; output should be semantically identical.
+
+### Phase 2: Core Commands
+
+**Goal:** Feature parity with essential Go beads commands.
+
+**Deliverables:**
+- [ ] update command
+- [ ] close command (single and batch)
+- [ ] ready command (unblocked issues)
+- [ ] blocked command
+- [ ] dep command (add, remove, tree)
+- [ ] label command (add, remove)
+- [ ] stats command
+- [ ] search command (SQLite FTS or basic LIKE)
+- [ ] Dirty tracking for incremental export
+
+**Validation:** Comprehensive conformance tests comparing bd and br outputs.
+
+### Phase 3: Sync and Git Integration
+
+**Goal:** Full sync workflow with git operations.
+
+**Deliverables:**
+- [ ] sync command (export + optional git commit)
+- [ ] Auto-import on stale detection
+- [ ] Git status integration
+- [ ] config command
+- [ ] doctor command (health checks)
+- [ ] Hook support (pre-commit, post-commit)
+
+**Validation:** Can use br as drop-in replacement for bd in typical workflows.
+
+### Phase 4: Optimization
+
+**Goal:** Make br faster than bd for all operations.
+
+**Deliverables:**
+- [ ] Performance benchmarks
+- [ ] Query optimization
+- [ ] Batch operations
+- [ ] Memory profiling
+- [ ] Binary size optimization
+- [ ] Startup time optimization
+
+**Validation:** Benchmark suite showing br performance vs bd.
+
+### Phase 5: Polish and Extensions
+
+**Goal:** Production-ready with nice-to-have features.
+
+**Deliverables:**
+- [ ] Shell completions (bash, zsh, fish, PowerShell)
+- [ ] TUI mode (optional, using ratatui)
+- [ ] Markdown rendering (glamour-style)
+- [ ] Color themes
+- [ ] Install scripts
+
+---
+
+## Conformance Testing Strategy
+
+To ensure br is a true drop-in replacement for bd:
+
+```rust
+// tests/conformance_test.rs
+
+use std::process::Command;
+use tempfile::TempDir;
+
+#[test]
+fn test_create_conformance() {
+    let temp = TempDir::new().unwrap();
+    let beads_dir = temp.path().join(".beads");
+
+    // Initialize with bd
+    Command::new("bd")
+        .args(["init", "--dir", beads_dir.to_str().unwrap()])
+        .status()
+        .unwrap();
+
+    // Create with br
+    let br_output = Command::new("br")
+        .args(["create", "Test issue", "-p", "1", "--json"])
+        .env("BEADS_DIR", &beads_dir)
+        .output()
+        .unwrap();
+
+    // List with bd
+    let bd_output = Command::new("bd")
+        .args(["list", "--json"])
+        .current_dir(&temp)
+        .output()
+        .unwrap();
+
+    // Parse and compare
+    let br_issue: serde_json::Value = serde_json::from_slice(&br_output.stdout).unwrap();
+    let bd_list: serde_json::Value = serde_json::from_slice(&bd_output.stdout).unwrap();
+
+    // Verify br's issue appears in bd's list
+    // ... comparison logic
+}
+```
+
+---
+
+## Migration Path for Existing Users
+
+For users switching from bd to br:
+
+1. **No migration needed:** br reads the same `.beads/` directory structure
+2. **Parallel operation:** Can use both bd and br on the same project
+3. **Gradual adoption:** Switch individual commands as comfortable
+4. **Fallback:** bd remains available if issues arise
+
+---
+
+## Success Criteria
+
+1. **Functional parity:** br handles all common bd workflows
+2. **Output compatibility:** JSON output matches bd for same inputs
+3. **Performance:** br is faster than bd for all measured operations
+4. **Binary size:** br binary is smaller than bd binary
+5. **Reliability:** Zero data loss in all tested scenarios
+
+---
+
+## Timeline and Effort
+
+This is a multi-session project. Rough estimates per phase:
+
+| Phase | Scope | Sessions |
+|-------|-------|----------|
+| Phase 1 | Foundation | 2-3 |
+| Phase 2 | Core Commands | 3-4 |
+| Phase 3 | Sync/Git | 2-3 |
+| Phase 4 | Optimization | 2-3 |
+| Phase 5 | Polish | 2-3 |
+| **Total** | | **11-16 sessions** |
+
+---
+
+## Open Questions
+
+1. **ID format:** Should we generate IDs identically to bd, or is semantic equivalence sufficient?
+2. **Schema version:** How do we handle schema differences if we diverge from bd?
+3. **Daemon:** Do we need the RPC daemon for the flywheel use case?
+4. **Full-text search:** Should we add Tantivy for better search, or stay with SQLite FTS?
+
+---
+
+## References
+
+- **Go beads source:** `./beads/` (this repo)
+- **xf source:** `/data/projects/xf`
+- **cass source:** `/data/projects/coding_agent_session_search`
+- **Flywheel documentation:** `/data/projects/agentic_coding_flywheel_setup`
+- **beads_viewer (bv):** Companion TUI for beads analysis
+
+---
+
+## Conclusion
+
+This port preserves the elegant simplicity of beads' SQLite + JSONL hybrid architecture while bringing the performance and reliability benefits of Rust. By following proven patterns from xf and cass, we can create a hyper-optimized `br` binary that serves as a drop-in replacement for `bd` in the agentic coding flywheel.
