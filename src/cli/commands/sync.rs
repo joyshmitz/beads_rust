@@ -81,6 +81,12 @@ pub fn execute(args: &SyncArgs, json: bool, cli: &config::CliOverrides) -> Resul
     let jsonl_path = paths.jsonl_path;
     let use_json = json || args.robot;
     let path_policy = validate_sync_paths(&beads_dir, &jsonl_path, args.allow_external_jsonl)?;
+    debug!(
+        jsonl_path = %path_policy.jsonl_path.display(),
+        manifest_path = %path_policy.manifest_path.display(),
+        external_jsonl = path_policy.is_external,
+        "Resolved sync path policy"
+    );
 
     // Handle --status flag
     if args.status {
@@ -107,6 +113,12 @@ fn validate_sync_paths(
     jsonl_path: &Path,
     allow_external_jsonl: bool,
 ) -> Result<SyncPathPolicy> {
+    debug!(
+        beads_dir = %beads_dir.display(),
+        jsonl_path = %jsonl_path.display(),
+        allow_external_jsonl,
+        "Validating sync paths"
+    );
     let canonical_beads = beads_dir.canonicalize().map_err(|e| {
         BeadsError::Config(format!(
             "Failed to resolve .beads directory {}: {e}",
@@ -154,6 +166,14 @@ fn validate_sync_paths(
     let manifest_path = canonical_beads.join(".manifest.json");
     let jsonl_temp_path = jsonl_path.with_extension("jsonl.tmp");
 
+    debug!(
+        jsonl_path = %jsonl_path.display(),
+        jsonl_temp_path = %jsonl_temp_path.display(),
+        manifest_path = %manifest_path.display(),
+        is_external,
+        "Sync path validation complete"
+    );
+
     Ok(SyncPathPolicy {
         jsonl_path,
         jsonl_temp_path,
@@ -177,6 +197,12 @@ fn execute_status(
 
     let jsonl_path = &path_policy.jsonl_path;
     let jsonl_exists = jsonl_path.exists();
+    debug!(
+        jsonl_path = %jsonl_path.display(),
+        jsonl_exists,
+        dirty_count,
+        "Computed sync status inputs"
+    );
 
     // Determine staleness
     let (jsonl_newer, db_newer) = if jsonl_exists {
@@ -207,6 +233,11 @@ fn execute_status(
         jsonl_newer,
         db_newer,
     };
+    debug!(
+        jsonl_newer,
+        db_newer,
+        "Computed sync staleness"
+    );
 
     if json {
         println!("{}", serde_json::to_string_pretty(&status)?);
@@ -243,6 +274,13 @@ fn execute_flush(
     info!("Starting JSONL export");
     let export_policy = parse_export_policy(args)?;
     let jsonl_path = &path_policy.jsonl_path;
+    debug!(
+        jsonl_path = %jsonl_path.display(),
+        external_jsonl = path_policy.is_external,
+        export_policy = %export_policy,
+        force = args.force,
+        "Export configuration resolved"
+    );
 
     // Check for dirty issues
     let dirty_ids = storage.get_dirty_issue_ids()?;
@@ -255,6 +293,10 @@ fn execute_flush(
         if existing_count > 0 {
             let issues = storage.get_all_issues_for_export()?;
             if issues.is_empty() {
+                warn!(
+                    jsonl_count = existing_count,
+                    "Refusing export of empty DB over non-empty JSONL"
+                );
                 return Err(BeadsError::Config(format!(
                     "Refusing to export empty database over non-empty JSONL file.\n\
                      Database has 0 issues, JSONL has {existing_count} issues.\n\
@@ -269,6 +311,12 @@ fn execute_flush(
                 let missing: Vec<_> = jsonl_ids.difference(&db_ids).collect();
 
                 if !missing.is_empty() {
+                    warn!(
+                        jsonl_count = jsonl_ids.len(),
+                        db_count = issues.len(),
+                        missing_count = missing.len(),
+                        "Refusing export because DB is stale relative to JSONL"
+                    );
                     let mut missing_list = missing.into_iter().cloned().collect::<Vec<_>>();
                     missing_list.sort();
                     let display_count = missing_list.len().min(10);
@@ -328,6 +376,14 @@ fn execute_flush(
     // Execute export
     info!(path = %jsonl_path.display(), "Writing issues.jsonl");
     let (export_result, report) = export_to_jsonl_with_policy(storage, jsonl_path, &export_config)?;
+    debug!(
+        issues_exported = report.issues_exported,
+        dependencies_exported = report.dependencies_exported,
+        labels_exported = report.labels_exported,
+        comments_exported = report.comments_exported,
+        errors = report.errors.len(),
+        "Export completed"
+    );
 
     debug!(
         issues = export_result.exported_count,
@@ -463,9 +519,16 @@ fn execute_import(
 ) -> Result<()> {
     info!("Starting JSONL import");
     let jsonl_path = &path_policy.jsonl_path;
+    debug!(
+        jsonl_path = %jsonl_path.display(),
+        external_jsonl = path_policy.is_external,
+        force = args.force,
+        "Import configuration resolved"
+    );
 
     // Check if JSONL exists
     if !jsonl_path.exists() {
+        warn!(path = %jsonl_path.display(), "JSONL path missing, skipping import");
         if json {
             let result = ImportResultOutput {
                 created: 0,
@@ -528,6 +591,7 @@ fn execute_import(
             });
         }
     };
+    debug!(orphan_mode = ?orphan_mode, "Import orphan handling configured");
 
     // Configure import
     let import_config = ImportConfig {
