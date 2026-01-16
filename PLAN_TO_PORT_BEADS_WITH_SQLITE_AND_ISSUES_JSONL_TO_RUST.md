@@ -169,6 +169,27 @@ It is intentionally explicit so implementation and tests do not require external
    - Importing with prefix mismatch or conflicting metadata
 4. **No implicit git behavior**: `br sync` must never run git commands or touch `.git/`.
 
+### Flag Matrix (Explicit Opt-In)
+
+| Flag | Applies To | Default | Meaning | Notes |
+| --- | --- | --- | --- | --- |
+| `--flush-only` | Export | required | Export DB → JSONL | Exactly one mode required |
+| `--import-only` | Import | required | Import JSONL → DB | Exactly one mode required |
+| `--force` | Export/Import | false | Allow risky override | Required for any data-loss scenario |
+| `--allow-external-jsonl` | Export/Import | false | Allow JSONL outside `.beads/` | Required if `BEADS_JSONL` or metadata points outside |
+| `--manifest` | Export | false | Write `.beads/.manifest.json` | Manifest path must be allowlisted |
+| `--status` | Read-only | false | Report sync status | No side effects |
+
+**Explicit opt-in rules:**
+- If `BEADS_JSONL` is set to a path outside `.beads/`, sync must **fail** unless
+  `--allow-external-jsonl` is provided.
+- If metadata `jsonl_export` points outside `.beads/`, same rule applies.
+- If both `--force` and `--allow-external-jsonl` are required, both must be present.
+
+**Safe defaults:**
+- No auto-sync, no background processes, no git operations.
+- Sync does not run if mode is ambiguous or unsafe without explicit flags.
+
 ### Preflight (Read-Only, Fail-Fast)
 
 Before any write, sync must run a preflight that:
