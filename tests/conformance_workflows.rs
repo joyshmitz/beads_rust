@@ -22,8 +22,31 @@ use serde_json::Value;
 use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
+use std::process::Command;
 use tempfile::TempDir;
 use tracing::info;
+
+// ============================================================================
+// BD AVAILABILITY CHECK
+// ============================================================================
+
+/// Check if bd (Go beads binary) is available for conformance tests
+fn bd_available() -> bool {
+    Command::new("bd")
+        .arg("version")
+        .output()
+        .is_ok_and(|o| o.status.success())
+}
+
+/// Skip test if bd is not available (used in CI where bd isn't installed)
+macro_rules! skip_if_no_bd {
+    () => {
+        if !bd_available() {
+            eprintln!("Skipping test: 'bd' not found (expected in CI)");
+            return;
+        }
+    };
+}
 
 // ============================================================================
 // NORMALIZATION AND COMPARISON HELPERS
@@ -508,6 +531,7 @@ pub struct CmdOutput {
 /// Test: Create multiple issues, update various fields, verify final state.
 #[test]
 fn conformance_workflow_create_update_lifecycle() {
+    skip_if_no_bd!();
     common::init_test_logging();
     info!("Starting conformance_workflow_create_update_lifecycle");
 
@@ -621,6 +645,7 @@ fn conformance_workflow_create_update_lifecycle() {
 /// Test: Create issues with dependencies, verify blocked/ready states.
 #[test]
 fn conformance_workflow_dependency_chain() {
+    skip_if_no_bd!();
     common::init_test_logging();
     info!("Starting conformance_workflow_dependency_chain");
 
@@ -723,6 +748,7 @@ fn conformance_workflow_dependency_chain() {
 /// Test: Close issues and verify state changes + stats.
 #[test]
 fn conformance_workflow_close_with_stats() {
+    skip_if_no_bd!();
     common::init_test_logging();
     info!("Starting conformance_workflow_close_with_stats");
 
@@ -809,6 +835,7 @@ fn conformance_workflow_close_with_stats() {
 /// Test: Delete issues and verify they don't appear in list.
 #[test]
 fn conformance_workflow_delete_lifecycle() {
+    skip_if_no_bd!();
     common::init_test_logging();
     info!("Starting conformance_workflow_delete_lifecycle");
 
@@ -873,6 +900,7 @@ fn conformance_workflow_delete_lifecycle() {
 /// Test: Complete workflow with create, update, deps, close, and delete.
 #[test]
 fn conformance_workflow_full_lifecycle() {
+    skip_if_no_bd!();
     common::init_test_logging();
     info!("Starting conformance_workflow_full_lifecycle");
 
@@ -1015,6 +1043,7 @@ fn conformance_workflow_full_lifecycle() {
 /// Test: Dependency removal workflow.
 #[test]
 fn conformance_workflow_dep_removal() {
+    skip_if_no_bd!();
     common::init_test_logging();
     info!("Starting conformance_workflow_dep_removal");
 
@@ -1088,6 +1117,7 @@ fn conformance_workflow_dep_removal() {
 /// Test: Multiple updates to same issue.
 #[test]
 fn conformance_workflow_sequential_updates() {
+    skip_if_no_bd!();
     common::init_test_logging();
     info!("Starting conformance_workflow_sequential_updates");
 
@@ -1188,6 +1218,7 @@ fn conformance_workflow_sequential_updates() {
 /// Test: Workflow with assignee changes.
 #[test]
 fn conformance_workflow_assignee_changes() {
+    skip_if_no_bd!();
     common::init_test_logging();
     info!("Starting conformance_workflow_assignee_changes");
 
