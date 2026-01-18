@@ -2,4 +2,4 @@
 source: tests/snapshots/cli_output.rs
 expression: normalize_output(&output.stdout)
 ---
-br version 0.1.4 (dev) (BRANCH@GIT_HASH)
+br version 0.1.7 (dev) (BRANCH@GIT_HASH)

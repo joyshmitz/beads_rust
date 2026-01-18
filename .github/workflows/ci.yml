@@ -149,7 +149,7 @@ jobs:
             target: aarch64-apple-darwin
             name: macos-arm64
           # macOS Intel
-          - os: macos-13
+          - os: macos-15
             target: x86_64-apple-darwin
             name: macos-x64
           # Windows x64
