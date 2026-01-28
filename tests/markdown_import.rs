@@ -37,7 +37,8 @@ feature
     assert!(output.status.success(), "create --file failed");
 
     assert!(output.stdout.contains("✓ Created 2 issues from issues.md:"));
-    assert!(output.stdout.contains("✓ bd-"));
+    // Issue lines are indented with spaces, not prefixed with checkmark
+    assert!(output.stdout.contains("  bd-"));
 
     // Verify list
     let output = run_br(&workspace, ["list"], "list");
