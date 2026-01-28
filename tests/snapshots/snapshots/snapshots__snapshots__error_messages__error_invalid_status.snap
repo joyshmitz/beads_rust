@@ -5,12 +5,12 @@ expression: normalize_output(&output.stderr)
 {
   "error": {
     "code": "INVALID_STATUS",
-    "context": {
-      "hint": null,
-      "status": "invalid"
-    },
-    "hint": "Valid statuses: open, in_progress, blocked, deferred, closed",
     "message": "Invalid status: invalid",
-    "retryable": true
+    "hint": "Valid statuses: open, in_progress, blocked, deferred, closed",
+    "retryable": true,
+    "context": {
+      "status": "invalid",
+      "hint": null
+    }
   }
 }

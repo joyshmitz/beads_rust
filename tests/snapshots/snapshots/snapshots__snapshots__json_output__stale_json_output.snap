@@ -4,10 +4,12 @@ expression: normalize_json(&json)
 ---
 [
   {
+    "created_at": "TIMESTAMP",
     "id": "ISSUE_ID",
-    "title": "Issue to update",
-    "status": "in_progress",
+    "issue_type": "task",
     "priority": 2,
+    "status": "open",
+    "title": "Stale issue",
     "updated_at": "TIMESTAMP"
   }
 ]

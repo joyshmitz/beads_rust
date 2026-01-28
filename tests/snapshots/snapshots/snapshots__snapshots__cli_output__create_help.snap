@@ -10,7 +10,7 @@ Arguments:
   [TITLE]  Issue title
 
 Options:
-      --ID-REDACTED <TITLE_FLAG>      Issue title (alternative flag)
+      --title <TITLE_FLAG>           Issue title (alternative to positional argument)
   -t, --type <TYPE>                  Issue type (task, bug, feature, etc.)
   -p, --priority <PRIORITY>          Priority (0-4 or P0-P4)
   -d, --description <DESCRIPTION>    Description
@@ -24,6 +24,7 @@ Options:
       --defer <DEFER>                Defer until date (RFC3339 or relative)
       --ID-REDACTED <EXTERNAL_REF>  External reference
       --ephemeral                    Mark as ephemeral (not exported to JSONL)
+  -s, --status <STATUS>              Initial status (open, deferred, in_progress, closed)
       --ID-REDACTED                      Preview without creating
       --silent                       Output only issue ID
   -f, --file <FILE>                  Create issues from a markdown file (bulk import)

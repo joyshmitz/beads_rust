@@ -4,10 +4,10 @@ expression: normalize_json(&json)
 ---
 [
   {
-    "close_reason": "Done",
-    "closed_at": "TIMESTAMP",
     "id": "ISSUE_ID",
+    "title": "Issue to close",
     "status": "closed",
-    "title": "Issue to close"
+    "closed_at": "TIMESTAMP",
+    "close_reason": "Done"
   }
 ]

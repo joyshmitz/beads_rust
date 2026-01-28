@@ -3,14 +3,15 @@ source: tests/snapshots/json_output.rs
 expression: normalize_json(&json)
 ---
 {
-  "compaction_level": 0,
+  "id": "ISSUE_ID",
+  "title": "New feature request",
+  "status": "open",
+  "priority": 1,
+  "issue_type": "feature",
   "created_at": "TIMESTAMP",
   "created_by": "ACTOR",
-  "id": "ISSUE_ID",
-  "issue_type": "feature",
-  "original_size": 0,
-  "priority": 1,
-  "status": "open",
-  "title": "New feature request",
-  "updated_at": "TIMESTAMP"
+  "updated_at": "TIMESTAMP",
+  "source_repo": ".",
+  "compaction_level": 0,
+  "original_size": 0
 }

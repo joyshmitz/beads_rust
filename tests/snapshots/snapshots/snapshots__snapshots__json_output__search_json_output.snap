@@ -5,10 +5,10 @@ expression: normalize_json(&json)
 [
   {
     "id": "ISSUE_ID",
-    "title": "Bug: Fix login",
+    "title": "Search target",
     "status": "open",
     "priority": 2,
-    "issue_type": "bug",
+    "issue_type": "task",
     "created_at": "TIMESTAMP",
     "created_by": "ACTOR",
     "updated_at": "TIMESTAMP",

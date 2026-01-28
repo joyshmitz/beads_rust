@@ -5,11 +5,11 @@ expression: normalize_output(&output.stderr)
 {
   "error": {
     "code": "CYCLE_DETECTED",
+    "message": "Cycle detected in dependencies: ID-REDACTED -> ID-REDACTED",
+    "hint": "Remove one dependency to break the cycle",
+    "retryable": false,
     "context": {
       "cycle_path": "ID-REDACTED -> ID-REDACTED"
-    },
-    "hint": "Remove one dependency to break the cycle",
-    "message": "Cycle detected in dependencies: ID-REDACTED -> ID-REDACTED",
-    "retryable": false
+    }
   }
 }

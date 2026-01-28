@@ -34,6 +34,7 @@ Commands:
   sync         Sync database with JSONL file (export or import)
   doctor       Run ID-REDACTED diagnostics
   info         Show diagnostic metadata about the workspace
+  schema       Emit JSON Schemas for br output types (for agent/tooling integration)
   where        Show the active .beads directory
   version      Show version information
   upgrade      Upgrade br to the latest version

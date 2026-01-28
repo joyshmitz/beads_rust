@@ -71,7 +71,7 @@ fn schema_tables_and_columns_exist() {
     }
 
     let blocked_columns = column_names(&conn, "blocked_issues_cache");
-    for column in ["issue_id", "blocked_by_json"] {
+    for column in ["issue_id", "blocked_by", "blocked_at"] {
         assert!(
             blocked_columns.contains(column),
             "missing blocked_issues_cache.{column}"
@@ -210,6 +210,7 @@ fn list_filters_respect_title_priority_and_closed() {
     let mut closed = fixtures::issue("Alpha closed");
     closed.priority = Priority::HIGH;
     closed.status = Status::Closed;
+    closed.closed_at = Some(Utc::now());
 
     let mut other = fixtures::issue("Beta other");
     other.priority = Priority::LOW;

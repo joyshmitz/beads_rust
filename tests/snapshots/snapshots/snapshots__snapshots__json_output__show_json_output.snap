@@ -4,15 +4,16 @@ expression: normalize_json(&json)
 ---
 [
   {
-    "compaction_level": 0,
+    "id": "ISSUE_ID",
+    "title": "Detailed issue",
+    "status": "open",
+    "priority": 2,
+    "issue_type": "task",
     "created_at": "TIMESTAMP",
     "created_by": "ACTOR",
-    "id": "ISSUE_ID",
-    "issue_type": "task",
-    "original_size": 0,
-    "priority": 2,
-    "status": "open",
-    "title": "Detailed issue",
-    "updated_at": "TIMESTAMP"
+    "updated_at": "TIMESTAMP",
+    "source_repo": ".",
+    "compaction_level": 0,
+    "original_size": 0
   }
 ]

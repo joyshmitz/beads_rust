@@ -5,9 +5,9 @@ expression: normalize_output(&output.stderr)
 {
   "error": {
     "code": "NOT_INITIALIZED",
-    "context": null,
-    "hint": "Run: br init",
     "message": "Beads not initialized: run 'br init' first",
-    "retryable": false
+    "hint": "Run: br init",
+    "retryable": false,
+    "context": null
   }
 }

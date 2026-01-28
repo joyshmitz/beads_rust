@@ -5,11 +5,11 @@ expression: normalize_output(&output.stderr)
 {
   "error": {
     "code": "SELF_DEPENDENCY",
+    "message": "Issue cannot depend on itself: ID-REDACTED",
+    "hint": "An issue cannot depend on itself",
+    "retryable": false,
     "context": {
       "id": "ID-REDACTED"
-    },
-    "hint": "An issue cannot depend on itself",
-    "message": "Issue cannot depend on itself: ID-REDACTED",
-    "retryable": false
+    }
   }
 }

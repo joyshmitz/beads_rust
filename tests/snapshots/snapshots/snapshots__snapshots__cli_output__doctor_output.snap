@@ -4,9 +4,11 @@ expression: normalize_output(&output.stdout)
 ---
 br doctor
 OK jsonl.merge_artifacts
-WARN jsonl.parse: No JSONL file found (.beads/issues.jsonl or .beads/beads.jsonl)
+OK sync_jsonl_path: JSONL path is within sync allowlist
+OK sync_conflict_markers: No merge conflict markers found
+OK jsonl.parse: Parsed 0 records
 OK schema.tables
 OK schema.columns
 OK sqlite.integrity_check
-WARN counts.db_vs_jsonl: JSONL not found; cannot compare counts
-OK sync.metadata: Database and JSONL are in sync
+OK counts.db_vs_jsonl: Both have 0 records
+OK sync.metadata: External changes pending import
