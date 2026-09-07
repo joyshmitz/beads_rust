@@ -7300,6 +7300,32 @@ impl SqliteStorage {
                     }
                 }
 
+                // Status updates affect each blocker's direct dependents as
+                // well as its own component. Collect them for the whole batch
+                // inside this transaction instead of querying once per issue.
+                // Include repeated statuses: cache invalidation also applies
+                // when a requested status equals the issue's current status.
+                let status_ids: Vec<_> = updates
+                    .iter()
+                    .filter(|(_, update)| update.status.is_some() && !update.skip_cache_rebuild)
+                    .map(|(id, _)| SqliteValue::from(id.as_str()))
+                    .collect();
+                for chunk in status_ids.chunks(400) {
+                    let placeholders = vec!["?"; chunk.len()].join(", ");
+                    let dependents = conn.query_with_params(
+                        &format!(
+                            "SELECT issue_id FROM dependencies WHERE depends_on_id IN ({placeholders})
+                             AND type IN ('blocks', 'conditional-blocks', 'waits-for')"
+                        ),
+                        chunk,
+                    )?;
+                    for row in &dependents {
+                        if let Some(dependent) = row.get(0).and_then(SqliteValue::as_text) {
+                            ctx.invalidate_cache_for(&[dependent]);
+                        }
+                    }
+                }
+
                 // GitHub #384 phase 5: record who moved each issue into its
                 // new status so scoped capacities can key future admissions.
                 for transition in &transitions {
@@ -7547,21 +7573,10 @@ impl SqliteStorage {
             if updates.skip_cache_rebuild {
                 ctx.invalidate_cache_deferred();
             } else {
-                // A status change affects this issue's parent-child component
-                // and every direct blocking dependent's component. Blocking
-                // edges depend on status, not on the blocker's cached readiness,
+                // Direct dependents are collected once for the atomic batch.
+                // Blocking edges depend on status, not on cached readiness,
                 // so they do not require recursive dependency traversal.
                 ctx.invalidate_cache_for(&[id]);
-                let dependents = conn.query_with_params(
-                    "SELECT issue_id FROM dependencies WHERE depends_on_id = ?
-                     AND type IN ('blocks', 'conditional-blocks', 'waits-for')",
-                    &[SqliteValue::from(id)],
-                )?;
-                for row in &dependents {
-                    if let Some(dependent) = row.get(0).and_then(SqliteValue::as_text) {
-                        ctx.invalidate_cache_for(&[dependent]);
-                    }
-                }
             }
         }
 
@@ -30464,26 +30479,64 @@ mod tests {
             .unwrap();
         assert_eq!(
             persisted_blocked_cache(&storage),
-            vec![
-                (
-                    "bd-blocks".to_string(),
-                    r#"["bd-a:in_progress"]"#.to_string()
-                ),
-                (
-                    "bd-conditional".to_string(),
-                    r#"["bd-a:in_progress"]"#.to_string()
-                ),
-                (
-                    "bd-other".to_string(),
-                    r#"["bd-other-blocker:open"]"#.to_string()
-                ),
-                (
-                    "bd-waits".to_string(),
-                    r#"["bd-a:in_progress"]"#.to_string()
-                ),
+            [
+                ("bd-blocks", r#"["bd-a:in_progress"]"#),
+                ("bd-conditional", r#"["bd-a:in_progress"]"#),
+                ("bd-other", r#"["bd-other-blocker:open"]"#),
+                ("bd-waits", r#"["bd-a:in_progress"]"#),
             ]
+            .into_iter()
+            .map(|(id, blockers)| (id.to_string(), blockers.to_string()))
+            .collect::<Vec<_>>()
         );
         assert!(!storage.blocked_cache_marked_stale().unwrap());
+    }
+
+    #[test]
+    fn test_status_batch_refreshes_dependents_across_query_chunks() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let ids: Vec<_> = (0..401)
+            .map(|index| format!("bd-blocker-{index}"))
+            .collect();
+        for id in ids
+            .iter()
+            .map(String::as_str)
+            .chain(["bd-first", "bd-last"])
+        {
+            storage
+                .create_issue(
+                    &make_issue(id, id, Status::Open, 2, None, Utc::now(), None),
+                    "tester",
+                )
+                .unwrap();
+        }
+        for (dependent, blocker) in [("bd-first", &ids[0]), ("bd-last", &ids[400])] {
+            storage
+                .add_dependency(dependent, blocker, "blocks", "tester")
+                .unwrap();
+        }
+        storage.ensure_blocked_cache_fresh().unwrap();
+        assert_eq!(persisted_blocked_cache(&storage).len(), 2);
+
+        let updates: Vec<_> = ids
+            .into_iter()
+            .map(|id| {
+                (
+                    id,
+                    IssueUpdate {
+                        status: Some(Status::Closed),
+                        ..IssueUpdate::default()
+                    },
+                )
+            })
+            .collect();
+        storage
+            .update_issues_atomically(&updates, "tester")
+            .unwrap();
+        assert!(persisted_blocked_cache(&storage).is_empty());
+        assert!(!storage.blocked_cache_marked_stale().unwrap());
+        assert!(storage.get_blockers("bd-first").unwrap().is_empty());
+        assert!(storage.get_blockers("bd-last").unwrap().is_empty());
     }
 
     #[test]
@@ -38065,8 +38118,6 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    #[ignore = "carried red from the stranded sync-safety workstream (failed identically on its own \
-                pre-merge snapshot); tracked for completion by the owning workstream"]
     fn write_transaction_reports_post_commit_authority_loss_without_retrying() {
         let dir = TempDir::new().unwrap();
         let beads_dir = dir.path().join(".beads");
@@ -38107,14 +38158,12 @@ mod tests {
         let structured = crate::error::StructuredError::from_error(&error);
         assert!(!structured.retryable);
         assert_eq!(structured.code.exit_code(), 6);
-        assert_eq!(
-            structured
-                .context
-                .as_ref()
-                .and_then(|context| context.get("committed"))
-                .and_then(serde_json::Value::as_bool),
-            Some(true)
-        );
+        let context = structured.context.as_ref().expect("commit evidence");
+        assert_eq!(context["primary_commit_state"], "committed_unwitnessed");
+        assert_eq!(context["primary_committed"], true);
+        assert_eq!(context["primary_witnessed"], false);
+        assert_eq!(context["requires_reconciliation"], true);
+        assert_eq!(context["retryable"], false);
         let error = error.to_string();
         assert!(
             error.contains("write transaction committed, but database authority changed"),
@@ -38124,10 +38173,14 @@ mod tests {
             error.contains("reconcile committed state before retrying"),
             "{error}"
         );
+        // The displaced connection fails closed. The committed WAL stays at
+        // the original path and replays over the hook's byte-identical copy.
+        drop(storage);
+        let reopened = SqliteStorage::open(&db_path).unwrap();
         assert_eq!(
-            storage.get_metadata("postcommit_exclusive").unwrap(),
+            reopened.get_metadata("postcommit_exclusive").unwrap(),
             Some("committed".to_string()),
-            "the connection's displaced inode must retain the committed mutation"
+            "the committed mutation must survive in the WAL at the database path"
         );
     }
 
