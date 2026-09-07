@@ -30612,6 +30612,7 @@ mod tests {
                 .conn
                 .query("SELECT blocked_by FROM blocked_issues_cache WHERE issue_id = 'bd-parent'")
                 .unwrap();
+            assert_eq!(rows.len(), usize::from(expected.is_some()));
             assert_eq!(
                 rows.first()
                     .and_then(|row| row.get(0))
