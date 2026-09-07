@@ -1520,8 +1520,8 @@ pub struct MutationContext {
     pub events: Vec<Event>,
     pub dirty_ids: HashSet<String>,
     pub invalidate_blocked_cache: bool,
-    /// When set, only these issue IDs (and their transitive parent-child
-    /// descendants) need their blocked-cache entries recomputed.  If `None`
+    /// When set, only these issue IDs and their connected parent-child
+    /// components need their blocked-cache entries recomputed. If `None`
     /// while `invalidate_blocked_cache` is true, the entire cache is rebuilt.
     pub cache_affected_ids: Option<HashSet<String>>,
     /// When true, skip the storage-layer post-commit cache refresh.  Command
@@ -1858,6 +1858,9 @@ impl MutationContext {
     /// affected IDs.  If `invalidate_cache()` was already called (which sets
     /// `cache_affected_ids = None`), the full rebuild path takes precedence.
     pub fn invalidate_cache_for(&mut self, ids: &[&str]) {
+        if self.invalidate_blocked_cache && self.cache_affected_ids.is_none() {
+            return;
+        }
         self.invalidate_blocked_cache = true;
         let set = self.cache_affected_ids.get_or_insert_with(HashSet::new);
         for id in ids {
@@ -2542,6 +2545,27 @@ impl SqliteStorage {
     /// needs the authority-gated owner-only repair first (GitHub #403).
     pub(crate) fn namespace_sidecars_need_mode_repair(path: &Path) -> Result<bool> {
         namespace_sidecar_mode_repair_required(path)
+    }
+
+    /// Whether the engine linked into this binary admits a namespace sidecar
+    /// with `sidecar_mode`/`sidecar_gid` beside `db_path` exactly as it is:
+    /// owner-only always, and (FrankenSQLite 0.3.18+) a group/other exposure
+    /// bounded by the database file's (GitHub #491).
+    #[cfg(unix)]
+    pub(crate) fn namespace_sidecar_mode_is_admitted(
+        sidecar_mode: u32,
+        sidecar_gid: u32,
+        db_path: &Path,
+    ) -> bool {
+        sidecar_mode.trailing_zeros() >= 6
+            || (sidecar_exposure_is_database_bounded(sidecar_mode, sidecar_gid, db_path)
+                && engine_accepts_database_bounded_sidecar_exposure())
+    }
+
+    /// The linked engine's sidecar permission rule, for doctor findings.
+    #[cfg(unix)]
+    pub(crate) fn engine_namespace_sidecar_rule() -> String {
+        engine_sidecar_rule_text()
     }
 
     pub(crate) fn open_current_read_only(path: &Path) -> Result<Option<Self>> {
@@ -6589,6 +6613,40 @@ impl SqliteStorage {
                     blocked_cache_plan = Some(BlockedCacheRefreshPlan::Full);
                 }
                 storage.set_metadata_in_tx(BLOCKED_CACHE_STATE_KEY, BLOCKED_CACHE_STATE_STALE)?;
+
+                if let Some(BlockedCacheRefreshPlan::Incremental(ids)) = &blocked_cache_plan {
+                    // Check freshness, update the component and clear stale in
+                    // the SAME write transaction. A second transaction could
+                    // clear an intervening writer's unrelated invalidation.
+                    // Keep the stale marker outside the savepoint so a cache
+                    // failure can preserve the primary mutation and fall back
+                    // to a complete post-commit repair.
+                    storage.conn.execute("SAVEPOINT br_blocked_cache")?;
+                    let refresh = Self::incremental_blocked_cache_update(&storage.conn, ids)
+                        .and_then(|count| {
+                            Self::upsert_metadata_key_in_tx(
+                                &storage.conn,
+                                BLOCKED_CACHE_STATE_KEY,
+                                METADATA_EMPTY_VALUE,
+                            )?;
+                            Ok(count)
+                        });
+                    match refresh {
+                        Ok(refreshed) => {
+                            storage.conn.execute("RELEASE br_blocked_cache")?;
+                            tracing::debug!(operation = op, refreshed, "Refreshed blocked cache inside mutation");
+                            blocked_cache_plan = None;
+                        }
+                        Err(error) => {
+                            // If either boundary fails, abort the outer
+                            // transaction rather than commit partial cache data.
+                            storage.conn.execute("ROLLBACK TO br_blocked_cache")?;
+                            storage.conn.execute("RELEASE br_blocked_cache")?;
+                            tracing::warn!(operation = op, %error, "Incremental cache refresh rolled back; scheduling full repair");
+                            blocked_cache_plan = Some(BlockedCacheRefreshPlan::Full);
+                        }
+                    }
+                }
             }
 
             if ctx.force_flush {
@@ -7242,6 +7300,32 @@ impl SqliteStorage {
                     }
                 }
 
+                // Status updates affect each blocker's direct dependents as
+                // well as its own component. Collect them for the whole batch
+                // inside this transaction instead of querying once per issue.
+                // Include repeated statuses: cache invalidation also applies
+                // when a requested status equals the issue's current status.
+                let status_ids: Vec<_> = updates
+                    .iter()
+                    .filter(|(_, update)| update.status.is_some() && !update.skip_cache_rebuild)
+                    .map(|(id, _)| SqliteValue::from(id.as_str()))
+                    .collect();
+                for chunk in status_ids.chunks(400) {
+                    let placeholders = vec!["?"; chunk.len()].join(", ");
+                    let dependents = conn.query_with_params(
+                        &format!(
+                            "SELECT issue_id FROM dependencies WHERE depends_on_id IN ({placeholders})
+                             AND type IN ('blocks', 'conditional-blocks', 'waits-for')"
+                        ),
+                        chunk,
+                    )?;
+                    for row in &dependents {
+                        if let Some(dependent) = row.get(0).and_then(SqliteValue::as_text) {
+                            ctx.invalidate_cache_for(&[dependent]);
+                        }
+                    }
+                }
+
                 // GitHub #384 phase 5: record who moved each issue into its
                 // new status so scoped capacities can key future admissions.
                 for transition in &transitions {
@@ -7489,7 +7573,10 @@ impl SqliteStorage {
             if updates.skip_cache_rebuild {
                 ctx.invalidate_cache_deferred();
             } else {
-                ctx.invalidate_cache();
+                // Direct dependents are collected once for the atomic batch.
+                // Blocking edges depend on status, not on cached readiness,
+                // so they do not require recursive dependency traversal.
+                ctx.invalidate_cache_for(&[id]);
             }
         }
 
@@ -7511,6 +7598,15 @@ impl SqliteStorage {
 
         // Issue type
         if let Some(ref issue_type) = updates.issue_type {
+            if issue.issue_type != *issue_type {
+                // Becoming or ceasing to be an epic changes child-open rollup,
+                // including when another issue changes status in this batch.
+                if updates.skip_cache_rebuild {
+                    ctx.invalidate_cache_deferred();
+                } else {
+                    ctx.invalidate_cache_for(&[id]);
+                }
+            }
             issue.issue_type.clone_from(issue_type);
             add_update("issue_type", SqliteValue::from(issue_type.as_str()));
         }
@@ -11116,7 +11212,7 @@ impl SqliteStorage {
     }
 
     /// Incremental blocked-cache update: recompute only the entries for the
-    /// given seed issue IDs and their transitive parent-child descendants.
+    /// given seed issue IDs and their connected parent-child components.
     ///
     /// This avoids the full DELETE + INSERT cycle of `rebuild_blocked_cache_impl`
     /// when only a small number of dependency edges changed.
@@ -16471,16 +16567,124 @@ fn remove_temp_db_files(path: &Path) {
 /// Report whether an fsqlite namespace sidecar needs an owner-only mode repair.
 ///
 /// fsqlite refuses to open `<db>-fsqlite-ns-gate` / `-fsqlite-ns-use` when the
-/// file carries any bit in `0o077`, and the refusal surfaces as a bare
-/// `Database error: unable to open database file: '<sidecar>'`, which reads as
-/// database corruption. This preflight is deliberately observational so the
-/// lock-free read-only opener can decline instead of chmod.
+/// file carries a group/other bit the engine's policy does not accept (see
+/// [`sidecar_exposure_is_database_bounded`] and
+/// [`engine_accepts_database_bounded_sidecar_exposure`]), and the refusal
+/// surfaces as a bare `Database error: unable to open database file:
+/// '<sidecar>'`, which reads as database corruption. This preflight is
+/// deliberately observational so the lock-free read-only opener can decline
+/// instead of chmod.
 #[cfg(unix)]
 #[derive(Debug)]
 struct NamespaceSidecarModeWitness {
     path: PathBuf,
     identity: (u64, u64),
     mode: u32,
+    /// The sidecar grants no group/other permission beyond the database
+    /// file's, per the engine's rule; such a sidecar is admitted by
+    /// FrankenSQLite 0.3.18+ without any repair.
+    database_bounded: bool,
+}
+
+#[cfg(unix)]
+impl NamespaceSidecarModeWitness {
+    /// Whether the engine linked into this binary would refuse the sidecar as
+    /// it is, so br must repair it before any open.
+    fn requires_repair(&self) -> bool {
+        !(self.database_bounded && engine_accepts_database_bounded_sidecar_exposure())
+    }
+}
+
+/// FrankenSQLite's rule for an existing namespace sidecar with group/other
+/// bits (frankensqlite `crates/fsqlite-vfs/src/namespace.rs`,
+/// `sidecar_exposure_is_acceptable`, commits 947d4aa85 and 64e75a742): the
+/// sidecar is acceptable when it grants no group/other permission that the
+/// main database file does not already grant, evaluated per principal class.
+/// POSIX resolves exactly one class per process and the group class names the
+/// file's group, so when the two files share a GID the sidecar's group bits
+/// are bounded by the database's group bits and its other bits by the
+/// database's other bits; when the GIDs differ a sidecar-group member may fall
+/// into either database class, so a sidecar bit is covered only by the
+/// database bit in *both* classes. A missing or non-regular database gives no
+/// baseline: not bounded. Kept in lockstep with the engine by a parity test
+/// that opens such a family through the linked engine.
+#[cfg(unix)]
+fn sidecar_exposure_is_database_bounded(
+    sidecar_mode: u32,
+    sidecar_gid: u32,
+    db_path: &Path,
+) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    let exposure = sidecar_mode & 0o077;
+    if exposure == 0 {
+        return true;
+    }
+    let Ok(database) = std::fs::symlink_metadata(db_path) else {
+        return false;
+    };
+    if !database.file_type().is_file() {
+        return false;
+    }
+    let database_group = database.mode() & 0o070;
+    let database_other = database.mode() & 0o007;
+    let (group_cover, other_cover) = if database.gid() == sidecar_gid {
+        (database_group, database_other)
+    } else {
+        let both = (database_group >> 3) & database_other;
+        (both << 3, both)
+    };
+    exposure & !(group_cover | other_cover) == 0
+}
+
+/// The first FrankenSQLite release whose namespace validator accepts a
+/// database-bounded sidecar exposure and a mount-imposed mask on a sidecar it
+/// just created (frankensqlite 947d4aa85 + 64e75a742, after the v0.3.17 tag).
+/// Older engines require owner-only (`mode & 0o077 == 0`) sidecars.
+#[cfg(unix)]
+const ENGINE_DATABASE_BOUNDED_SIDECAR_EXPOSURE_SINCE: (u64, u64, u64) = (0, 3, 18);
+
+/// The locked `fsqlite` version this binary was built against, from
+/// `BR_FSQLITE_VERSION` (emitted by `build.rs` from `Cargo.lock`).
+#[cfg(unix)]
+fn linked_engine_version() -> Option<(u64, u64, u64)> {
+    parse_engine_version(option_env!("BR_FSQLITE_VERSION")?)
+}
+
+#[cfg(unix)]
+fn parse_engine_version(version: &str) -> Option<(u64, u64, u64)> {
+    let core = version.split(['-', '+']).next()?;
+    let mut parts = core.split('.').map(|part| part.parse::<u64>().ok());
+    let major = parts.next()??;
+    let minor = parts.next()??;
+    let patch = parts.next()??;
+    Some((major, minor, patch))
+}
+
+/// Whether the engine linked into this binary admits a namespace sidecar whose
+/// group/other bits are bounded by the database file's (and a mount mask on a
+/// sidecar it just created). An unknown engine version is treated as the
+/// stricter, older policy so br keeps repairing.
+#[cfg(unix)]
+fn engine_accepts_database_bounded_sidecar_exposure() -> bool {
+    linked_engine_version()
+        .is_some_and(|version| version >= ENGINE_DATABASE_BOUNDED_SIDECAR_EXPOSURE_SINCE)
+}
+
+/// Human-readable statement of the linked engine's sidecar permission rule,
+/// for refusal messages.
+#[cfg(unix)]
+fn engine_sidecar_rule_text() -> String {
+    let version = option_env!("BR_FSQLITE_VERSION").unwrap_or("unknown");
+    if engine_accepts_database_bounded_sidecar_exposure() {
+        format!(
+            "FrankenSQLite {version} (linked into this br) accepts a namespace lock sidecar only when it is owner-only (0600) or grants no group/other permission beyond the database file's"
+        )
+    } else {
+        format!(
+            "FrankenSQLite {version} (linked into this br) accepts a namespace lock sidecar only when it is owner-only (0600); FrankenSQLite 0.3.18+ also accepts a sidecar that grants no group/other permission beyond the database file's, which is what a permission-less mount reports for every file, so a br release built on that engine works on such a mount"
+        )
+    }
 }
 
 #[cfg(unix)]
@@ -16507,10 +16711,13 @@ fn namespace_sidecar_mode_repair_witnesses(
         }
         let mode = metadata.permissions().mode();
         if mode & 0o077 != 0 {
+            let database_bounded =
+                sidecar_exposure_is_database_bounded(mode, metadata.gid(), db_path);
             witnesses.push(NamespaceSidecarModeWitness {
                 path: sidecar,
                 identity: (metadata.dev(), metadata.ino()),
                 mode,
+                database_bounded,
             });
         }
     }
@@ -16539,9 +16746,16 @@ fn permissionless_filesystem_error(
     sidecar: &Path,
     observed_mode: u32,
     evidence: &str,
+    database_bounded: bool,
 ) -> BeadsError {
+    let rule = engine_sidecar_rule_text();
+    let scope = if database_bounded {
+        "The sidecar grants nothing beyond the database file itself (the mount reports the same mask for every file), so nothing here is a repairable permission problem."
+    } else {
+        "The sidecar also grants group/other permission that the database file does not, and the filesystem will not let br take it away."
+    };
     BeadsError::Config(format!(
-        "fsqlite namespace sidecar {} reports mode {:04o} {evidence}: the filesystem holding this database does not persist POSIX permission bits, and FrankenSQLite requires its namespace lock sidecars to be owner-only (0600). This is typical of a Windows drive under WSL (/mnt/<drive>) mounted without the `metadata` option, of FAT/exFAT volumes, and of some network mounts. Remedy: on WSL add `[automount]` with `options = \"metadata\"` to /etc/wsl.conf and run `wsl --shutdown`, or keep the .beads database on the Linux filesystem (for example under $HOME); a Windows build of br can write a database on a Windows drive from Windows",
+        "fsqlite namespace sidecar {} reports mode {:04o} {evidence}: the filesystem holding this database does not persist POSIX permission bits. {rule}. {scope} This is typical of a Windows drive under WSL (/mnt/<drive>) mounted without the `metadata` option, of FAT/exFAT volumes, and of some network mounts. Remedy: on WSL add `[automount]` with `options = \"metadata\"` to /etc/wsl.conf and run `wsl --shutdown`, or keep the .beads database on the Linux filesystem (for example under $HOME); a Windows build of br can write a database on a Windows drive from Windows",
         sidecar.display(),
         observed_mode & 0o7777,
     ))
@@ -16622,6 +16836,8 @@ fn explain_engine_open_error(
                 ));
             }
             if mode & 0o077 != 0 {
+                let database_bounded =
+                    sidecar_exposure_is_database_bounded(mode, metadata.gid(), db_path);
                 if absent_sidecars_before_open.contains(&suffix) {
                     // The engine created this file with mode 0600 during the
                     // open that just failed; the bits it reads back are the
@@ -16630,10 +16846,31 @@ fn explain_engine_open_error(
                         path,
                         mode,
                         "immediately after fsqlite created it with mode 0600",
+                        database_bounded,
                     );
                 }
+                let database_missing = !std::fs::symlink_metadata(db_path)
+                    .is_ok_and(|database| database.file_type().is_file());
+                if database_missing {
+                    return BeadsError::Config(format!(
+                        "fsqlite refused its namespace sidecar {} because it has mode {:04o} and there is no regular database file beside it to bound that mode against. The sidecar is an orphaned, regenerable lock file; move it out of the way (or restore the database) and retry",
+                        path.display(),
+                        mode & 0o7777,
+                    ));
+                }
+                let rule = engine_sidecar_rule_text();
+                let situation = if database_bounded {
+                    "The sidecar grants nothing beyond the database file itself, so this is either an older engine that still requires owner-only sidecars or a filesystem that will not hold the repaired mode".to_string()
+                } else {
+                    let database_mode = std::fs::symlink_metadata(db_path)
+                        .map(|database| database.permissions().mode() & 0o7777)
+                        .unwrap_or(0);
+                    format!(
+                        "The sidecar is looser than the database file (mode {database_mode:04o}), which no engine version accepts"
+                    )
+                };
                 return BeadsError::Config(format!(
-                    "fsqlite refused its namespace sidecar {} because it has mode {:04o} and the engine requires owner-only permissions (0600); the database itself is fine. br repairs this automatically when it opens the database under its database-family authority; otherwise run `br doctor --repair` or `chmod 0600 {}`",
+                    "fsqlite refused its namespace sidecar {} because it has mode {:04o}; the database itself is fine. {rule}. {situation}. br repairs the mode automatically when it opens the database under its database-family authority; otherwise run `br doctor --repair` or `chmod 0600 {}`",
                     path.display(),
                     mode & 0o7777,
                     path.display(),
@@ -16651,7 +16888,9 @@ fn explain_engine_open_error(
 fn namespace_sidecar_mode_repair_required(db_path: &Path) -> Result<bool> {
     #[cfg(unix)]
     {
-        Ok(!namespace_sidecar_mode_repair_witnesses(db_path)?.is_empty())
+        Ok(namespace_sidecar_mode_repair_witnesses(db_path)?
+            .iter()
+            .any(NamespaceSidecarModeWitness::requires_repair))
     }
     #[cfg(not(unix))]
     {
@@ -17197,7 +17436,15 @@ fn heal_namespace_sidecar_modes_under_authority(
     {
         use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 
-        let repair_witnesses = namespace_sidecar_mode_repair_witnesses(db_path)?;
+        // A sidecar the linked engine already admits as it is (group/other
+        // bits bounded by the database file's, FrankenSQLite 0.3.18+) needs
+        // no repair; touching it would only add a mutation the verdict path
+        // does not need.
+        let repair_witnesses: Vec<NamespaceSidecarModeWitness> =
+            namespace_sidecar_mode_repair_witnesses(db_path)?
+                .into_iter()
+                .filter(NamespaceSidecarModeWitness::requires_repair)
+                .collect();
         if repair_witnesses.is_empty() {
             return Ok(());
         }
@@ -17223,6 +17470,7 @@ fn heal_namespace_sidecar_modes_under_authority(
         }
 
         for witness in repair_witnesses {
+            let database_bounded = witness.database_bounded;
             let sidecar = witness.path;
             let initial_metadata = match std::fs::symlink_metadata(&sidecar) {
                 Ok(metadata) => metadata,
@@ -17299,12 +17547,13 @@ fn heal_namespace_sidecar_modes_under_authority(
                             "and the owner's chmod to {:04o} was refused ({error})",
                             repaired_mode & 0o7777
                         ),
+                        database_bounded,
                     ));
                 }
                 return Err(BeadsError::Io(std::io::Error::new(
                     std::io::ErrorKind::PermissionDenied,
                     format!(
-                        "fsqlite namespace sidecar {} has mode {:04o} and is owned by uid {}, not the current user (uid {}); fsqlite requires an owner-only (0600) sidecar owned by the user running br, and the authority-gated handle repair failed ({error}). Have the owner run `chmod 0600` on it, or remove the stale sidecar files (they are regenerable lock files) as the owner",
+                        "fsqlite namespace sidecar {} has mode {:04o} and is owned by uid {}, not the current user (uid {}); FrankenSQLite admits only sidecars owned by the user running br, and the authority-gated handle repair failed ({error}). Have the owner run `chmod 0600` on it, or remove the stale sidecar files (they are regenerable lock files) as the owner",
                         sidecar.display(),
                         observed_mode & 0o7777,
                         handle_metadata.uid(),
@@ -17340,6 +17589,7 @@ fn heal_namespace_sidecar_modes_under_authority(
                         "after the owner's chmod to {:04o} returned success",
                         repaired_mode & 0o7777
                     ),
+                    database_bounded,
                 ));
             }
             verify_namespace_healing_authority(db_path, authority)?;
@@ -21770,6 +22020,9 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let db_path = temp.path().join("beads.db");
         fs::write(&db_path, b"not inspected").unwrap();
+        // The database's mode is the baseline the advice compares against;
+        // pin it so the test does not depend on the host umask.
+        fs::set_permissions(&db_path, fs::Permissions::from_mode(0o644)).unwrap();
         let gate = database_sidecar_path(&db_path, "-fsqlite-ns-gate");
         let cannot_open = || fsqlite_error::FrankenError::CannotOpen { path: gate.clone() };
 
@@ -21795,9 +22048,44 @@ mod tests {
         assert!(matches!(explained, BeadsError::Config(_)), "{explained:?}");
         let text = explained.to_string();
         assert!(text.contains("has mode 0777"), "{text}");
-        assert!(text.contains("owner-only permissions (0600)"), "{text}");
+        assert!(text.contains("owner-only (0600)"), "{text}");
+        assert!(
+            text.contains("looser than the database file (mode 0644)"),
+            "{text}"
+        );
         assert!(text.contains("br doctor --repair"), "{text}");
         assert!(!text.contains("does not persist"), "{text}");
+
+        // A database-bounded exposure on an existing sidecar: the advice names
+        // the engine rule instead of calling the mode a violation.
+        fs::set_permissions(&db_path, fs::Permissions::from_mode(0o777)).unwrap();
+        let explained = explain_engine_open_error(&db_path, &[], cannot_open());
+        let text = explained.to_string();
+        assert!(
+            text.contains("grants nothing beyond the database file"),
+            "{text}"
+        );
+        assert!(text.contains("FrankenSQLite"), "{text}");
+        fs::set_permissions(&db_path, fs::Permissions::from_mode(0o644)).unwrap();
+
+        // No database beside the sidecar: nothing to bound against.
+        let orphan_dir = TempDir::new().unwrap();
+        let orphan_db = orphan_dir.path().join("beads.db");
+        let orphan_gate = database_sidecar_path(&orphan_db, "-fsqlite-ns-gate");
+        fs::write(&orphan_gate, b"").unwrap();
+        fs::set_permissions(&orphan_gate, fs::Permissions::from_mode(0o644)).unwrap();
+        let explained = explain_engine_open_error(
+            &orphan_db,
+            &[],
+            fsqlite_error::FrankenError::CannotOpen {
+                path: orphan_gate.clone(),
+            },
+        );
+        let text = explained.to_string();
+        assert!(
+            text.contains("no regular database file beside it"),
+            "{text}"
+        );
 
         // Extra hard link, owner-only mode.
         fs::set_permissions(&gate, fs::Permissions::from_mode(0o600)).unwrap();
@@ -21879,6 +22167,7 @@ mod tests {
     /// refuse with the named limitation — never with the bare engine error.
     #[cfg(unix)]
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn permissionless_mount_snapshot_reads_and_write_is_supported_or_explained() {
         use std::os::unix::fs::PermissionsExt;
 
@@ -21940,6 +22229,47 @@ mod tests {
                     None,
                 );
                 storage.create_issue(&issue, "tester").unwrap();
+                drop(storage);
+                drop(authority);
+
+                // The first write created the sidecars, which now report the
+                // mount mask. Every later command must still work: a second
+                // write through a fresh authority, and the lock-free read lane.
+                let authority = Arc::new(
+                    crate::sync::blocking_database_family_write_lock_with_timeout(
+                        &beads_dir,
+                        &db_path,
+                        Some(1_000),
+                    )
+                    .unwrap(),
+                );
+                assert!(matches!(
+                    SqliteStorage::inspect_pending_sync_merge_under_authority(&db_path, &authority)
+                        .expect("verdict with mount-mask sidecars present"),
+                    PendingSyncMergeInspection::Absent
+                ));
+                let mut storage = SqliteStorage::open_with_timeout_under_write_authority(
+                    &db_path,
+                    Some(50),
+                    &authority,
+                )
+                .expect("second write open with mount-mask sidecars present");
+                let issue = make_issue(
+                    "bd-mount-write-2",
+                    "second write on a permission-less mount",
+                    Status::Open,
+                    2,
+                    None,
+                    Utc::now(),
+                    None,
+                );
+                storage.create_issue(&issue, "tester").unwrap();
+                drop(storage);
+                drop(authority);
+                let storage = SqliteStorage::open_current_read_only(&db_path)
+                    .expect("read-only open with mount-mask sidecars present")
+                    .expect("read-only lane admits mount-mask sidecars");
+                assert!(storage.get_issue("bd-mount-write-2").unwrap().is_some());
             }
             Err(error) => {
                 let text = error.to_string();
@@ -21951,6 +22281,249 @@ mod tests {
                 assert!(text.contains("/etc/wsl.conf"), "{text}");
                 assert!(!text.contains("unable to open database file"), "{text}");
             }
+        }
+    }
+
+    /// GitHub #491: br's copy of the engine's sidecar exposure rule and its
+    /// engine-version gate must agree with the FrankenSQLite actually linked.
+    /// A same-GID family at 0664/0664 is database-bounded: the engine opens it
+    /// iff br believes it does; a sidecar looser than its database is refused
+    /// by every engine version.
+    #[cfg(unix)]
+    #[test]
+    fn sidecar_exposure_rule_matches_the_linked_engine() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("beads.db");
+        seed_closed_database(&db_path, "bd-parity");
+        let sidecars = existing_namespace_sidecars(&db_path);
+        assert_eq!(sidecars.len(), 2);
+        let set = |path: &Path, mode: u32| {
+            fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+        };
+        let gid = fs::metadata(&db_path).unwrap().gid();
+
+        set(&db_path, 0o664);
+        for sidecar in &sidecars {
+            set(sidecar, 0o664);
+        }
+        assert!(sidecar_exposure_is_database_bounded(
+            0o100_664, gid, &db_path
+        ));
+        let bounded_open = Connection::open(db_path.to_string_lossy().into_owned());
+        assert_eq!(
+            bounded_open.is_ok(),
+            engine_accepts_database_bounded_sidecar_exposure(),
+            "br's engine gate ({:?}) disagrees with the linked engine's verdict on a database-bounded sidecar exposure: {:?}",
+            option_env!("BR_FSQLITE_VERSION"),
+            bounded_open.err()
+        );
+        drop(bounded_open);
+
+        set(&db_path, 0o644);
+        assert!(!sidecar_exposure_is_database_bounded(
+            0o100_664, gid, &db_path
+        ));
+        let looser_open = Connection::open(db_path.to_string_lossy().into_owned());
+        assert!(
+            matches!(
+                looser_open,
+                Err(fsqlite_error::FrankenError::CannotOpen { .. })
+            ),
+            "a sidecar looser than its database must be refused by the engine: {looser_open:?}"
+        );
+
+        for sidecar in &sidecars {
+            set(sidecar, 0o600);
+        }
+        Connection::open(db_path.to_string_lossy().into_owned())
+            .expect("owner-only sidecars are always admitted");
+    }
+
+    /// The per-class, GID-aware bound (frankensqlite 64e75a742) and the
+    /// engine-version parser.
+    #[cfg(unix)]
+    #[test]
+    fn database_bounded_exposure_rule_table() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("rule.db");
+        fs::write(&db_path, b"db").unwrap();
+        let gid = fs::metadata(&db_path).unwrap().gid();
+        let other_gid = gid.wrapping_add(1);
+        let set_db = |mode: u32| {
+            fs::set_permissions(&db_path, fs::Permissions::from_mode(mode)).unwrap();
+        };
+
+        // Owner-only is always bounded, even without a database.
+        assert!(sidecar_exposure_is_database_bounded(
+            0o100_600,
+            gid,
+            &temp.path().join("missing.db")
+        ));
+        assert!(!sidecar_exposure_is_database_bounded(
+            0o100_644,
+            gid,
+            &temp.path().join("missing.db")
+        ));
+
+        for (db_mode, sidecar_mode, sidecar_gid, bounded) in [
+            (0o644, 0o644, gid, true),
+            (0o644, 0o640, gid, true),
+            (0o644, 0o664, gid, false),
+            (0o664, 0o664, gid, true),
+            (0o777, 0o777, gid, true),
+            (0o600, 0o640, gid, false),
+            // Different group: the sidecar's group bits must be covered by the
+            // database's group AND other bits (a sidecar-group member may be
+            // "other" to the database).
+            (0o664, 0o664, other_gid, false),
+            (0o644, 0o644, other_gid, true),
+            (0o646, 0o664, other_gid, false),
+            (0o666, 0o664, other_gid, true),
+            (0o777, 0o777, other_gid, true),
+        ] {
+            set_db(db_mode);
+            assert_eq!(
+                sidecar_exposure_is_database_bounded(
+                    0o100_000 | sidecar_mode,
+                    sidecar_gid,
+                    &db_path
+                ),
+                bounded,
+                "db {db_mode:04o} sidecar {sidecar_mode:04o} same_gid={}",
+                sidecar_gid == gid
+            );
+        }
+
+        assert_eq!(parse_engine_version("0.3.16"), Some((0, 3, 16)));
+        assert_eq!(parse_engine_version("0.3.18-rc.1"), Some((0, 3, 18)));
+        assert_eq!(parse_engine_version("1.0.0+build"), Some((1, 0, 0)));
+        assert_eq!(parse_engine_version("0.3"), None);
+        assert_eq!(parse_engine_version("x.y.z"), None);
+        assert!((0, 4, 0) > ENGINE_DATABASE_BOUNDED_SIDECAR_EXPOSURE_SINCE);
+        assert!((0, 3, 17) < ENGINE_DATABASE_BOUNDED_SIDECAR_EXPOSURE_SINCE);
+    }
+
+    /// GitHub #491, hermetic: a family whose database and sidecars all report
+    /// the mount mask (0777) on a mount that ignores chmod. With an engine that
+    /// admits database-bounded exposure, br must neither repair nor refuse —
+    /// writes, the verdict and the lock-free read lane all proceed. With an
+    /// older engine br refuses up front and names both the mount and the engine
+    /// rule instead of the bare engine error.
+    #[cfg(unix)]
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn mount_mask_family_follows_the_linked_engine_rule() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("beads.db");
+        seed_closed_database(&db_path, "bd-mask");
+        let sidecars = existing_namespace_sidecars(&db_path);
+        assert_eq!(sidecars.len(), 2);
+        for path in sidecars.iter().chain(std::iter::once(&db_path)) {
+            fs::set_permissions(path, fs::Permissions::from_mode(0o777)).unwrap();
+        }
+        let _guard = ChmodIgnoredGuard;
+        SqliteStorage::set_namespace_sidecar_chmod_ignored_for_test(true);
+        let authority = Arc::new(
+            crate::sync::blocking_database_family_write_lock_with_timeout(
+                temp.path(),
+                &db_path,
+                Some(1_000),
+            )
+            .unwrap(),
+        );
+
+        assert!(
+            namespace_sidecar_mode_repair_witnesses(&db_path)
+                .unwrap()
+                .iter()
+                .all(|witness| witness.database_bounded),
+            "every sidecar in a mount-mask family is database-bounded"
+        );
+
+        if engine_accepts_database_bounded_sidecar_exposure() {
+            assert!(!namespace_sidecar_mode_repair_required(&db_path).unwrap());
+            assert!(matches!(
+                SqliteStorage::inspect_pending_sync_merge_under_authority(&db_path, &authority)
+                    .expect("verdict without repair"),
+                PendingSyncMergeInspection::Absent
+            ));
+            let mut storage = SqliteStorage::open_with_timeout_under_write_authority(
+                &db_path,
+                Some(50),
+                &authority,
+            )
+            .expect("write open admits a mount-mask family");
+            let issue = make_issue(
+                "bd-mask-2",
+                "write under a mount mask",
+                Status::Open,
+                2,
+                None,
+                Utc::now(),
+                None,
+            );
+            storage.create_issue(&issue, "tester").unwrap();
+            drop(storage);
+            let storage = SqliteStorage::open_current_read_only(&db_path)
+                .expect("read-only lane")
+                .expect("read-only lane admits a mount-mask family");
+            assert!(storage.get_issue("bd-mask-2").unwrap().is_some());
+        } else {
+            assert!(namespace_sidecar_mode_repair_required(&db_path).unwrap());
+            assert!(
+                SqliteStorage::open_current_read_only(&db_path)
+                    .expect("read-only lane")
+                    .is_none(),
+                "the lock-free lane declines so the authority path can classify"
+            );
+            for (lane, error) in [
+                (
+                    "write open",
+                    SqliteStorage::open_with_timeout_under_write_authority(
+                        &db_path,
+                        Some(50),
+                        &authority,
+                    )
+                    .expect_err("older engine: refused"),
+                ),
+                (
+                    "verdict",
+                    SqliteStorage::inspect_pending_sync_merge_under_authority(&db_path, &authority)
+                        .expect_err("older engine: refused"),
+                ),
+            ] {
+                assert!(matches!(error, BeadsError::Config(_)), "{lane}: {error:?}");
+                let text = error.to_string();
+                for needle in [
+                    "does not persist POSIX permission bits",
+                    "grants nothing beyond the database file",
+                    "FrankenSQLite 0.3.18+",
+                    "/etc/wsl.conf",
+                ] {
+                    assert!(
+                        text.contains(needle),
+                        "{lane}: missing {needle:?} in {text}"
+                    );
+                }
+                assert!(
+                    !text.contains("unable to open database file"),
+                    "{lane}: {text}"
+                );
+            }
+        }
+        for path in sidecars.iter().chain(std::iter::once(&db_path)) {
+            assert_eq!(
+                fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                0o777,
+                "{} keeps the mount mask",
+                path.display()
+            );
         }
     }
 
@@ -29772,6 +30345,337 @@ mod tests {
         );
     }
 
+    fn persisted_blocked_cache(storage: &SqliteStorage) -> Vec<(String, String)> {
+        storage
+            .conn
+            .query("SELECT issue_id, blocked_by FROM blocked_issues_cache ORDER BY issue_id")
+            .unwrap()
+            .iter()
+            .map(|row| {
+                (
+                    row.get(0)
+                        .and_then(SqliteValue::as_text)
+                        .unwrap()
+                        .to_string(),
+                    row.get(1)
+                        .and_then(SqliteValue::as_text)
+                        .unwrap()
+                        .to_string(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_full_blocked_cache_invalidation_dominates_incremental() {
+        for full_first in [false, true] {
+            let mut ctx = MutationContext::new("test", "tester");
+            if full_first {
+                ctx.invalidate_cache();
+                ctx.invalidate_cache_for(&["bd-a"]);
+            } else {
+                ctx.invalidate_cache_for(&["bd-a"]);
+                ctx.invalidate_cache();
+            }
+            ctx.invalidate_cache_for(&["bd-b"]);
+            assert!(matches!(
+                BlockedCacheRefreshPlan::from_context(&ctx),
+                Some(BlockedCacheRefreshPlan::Full)
+            ));
+        }
+    }
+
+    #[test]
+    fn test_status_batch_refreshes_persisted_blockers_selectively() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        for id in [
+            "bd-a",
+            "bd-b",
+            "bd-blocks",
+            "bd-waits",
+            "bd-conditional",
+            "bd-related",
+            "bd-other",
+            "bd-other-blocker",
+        ] {
+            storage
+                .create_issue(
+                    &make_issue(id, id, Status::Open, 2, None, Utc::now(), None),
+                    "tester",
+                )
+                .unwrap();
+        }
+        for (id, kind) in [
+            ("bd-blocks", "blocks"),
+            ("bd-waits", "waits-for"),
+            ("bd-conditional", "conditional-blocks"),
+            ("bd-related", "related"),
+        ] {
+            storage.add_dependency(id, "bd-a", kind, "tester").unwrap();
+        }
+        storage
+            .add_dependency("bd-blocks", "bd-b", "blocks", "tester")
+            .unwrap();
+        storage
+            .add_dependency("bd-other", "bd-other-blocker", "blocks", "tester")
+            .unwrap();
+        storage.ensure_blocked_cache_fresh().unwrap();
+        storage.conn.execute("UPDATE blocked_issues_cache SET blocked_at = '2000-01-01' WHERE issue_id = 'bd-other'").unwrap();
+
+        // Closing only one blocker must preserve the second blocker. Query the
+        // persisted rows, not getters that can silently compute from the graph.
+        storage
+            .update_issue(
+                "bd-a",
+                &IssueUpdate {
+                    status: Some(Status::Closed),
+                    ..IssueUpdate::default()
+                },
+                "tester",
+            )
+            .unwrap();
+        assert_eq!(
+            persisted_blocked_cache(&storage),
+            vec![
+                ("bd-blocks".to_string(), r#"["bd-b:open"]"#.to_string()),
+                (
+                    "bd-other".to_string(),
+                    r#"["bd-other-blocker:open"]"#.to_string()
+                ),
+            ]
+        );
+        let untouched = storage
+            .conn
+            .query_row("SELECT blocked_at FROM blocked_issues_cache WHERE issue_id = 'bd-other'")
+            .unwrap();
+        assert_eq!(
+            untouched.get(0).and_then(SqliteValue::as_text),
+            Some("2000-01-01")
+        );
+        assert!(!storage.blocked_cache_marked_stale().unwrap());
+
+        // One atomic batch must merge both invalidation sets, and reopening
+        // restores all three blocking types without treating related as one.
+        storage
+            .update_issues_atomically(
+                &[
+                    (
+                        "bd-a".to_string(),
+                        IssueUpdate {
+                            status: Some(Status::InProgress),
+                            ..IssueUpdate::default()
+                        },
+                    ),
+                    (
+                        "bd-b".to_string(),
+                        IssueUpdate {
+                            status: Some(Status::Closed),
+                            ..IssueUpdate::default()
+                        },
+                    ),
+                ],
+                "tester",
+            )
+            .unwrap();
+        assert_eq!(
+            persisted_blocked_cache(&storage),
+            [
+                ("bd-blocks", r#"["bd-a:in_progress"]"#),
+                ("bd-conditional", r#"["bd-a:in_progress"]"#),
+                ("bd-other", r#"["bd-other-blocker:open"]"#),
+                ("bd-waits", r#"["bd-a:in_progress"]"#),
+            ]
+            .into_iter()
+            .map(|(id, blockers)| (id.to_string(), blockers.to_string()))
+            .collect::<Vec<_>>()
+        );
+        assert!(!storage.blocked_cache_marked_stale().unwrap());
+    }
+
+    #[test]
+    fn test_status_batch_refreshes_dependents_across_query_chunks() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let ids: Vec<_> = (0..401)
+            .map(|index| format!("bd-blocker-{index}"))
+            .collect();
+        for id in ids
+            .iter()
+            .map(String::as_str)
+            .chain(["bd-first", "bd-last"])
+        {
+            storage
+                .create_issue(
+                    &make_issue(id, id, Status::Open, 2, None, Utc::now(), None),
+                    "tester",
+                )
+                .unwrap();
+        }
+        for (dependent, blocker) in [("bd-first", &ids[0]), ("bd-last", &ids[400])] {
+            storage
+                .add_dependency(dependent, blocker, "blocks", "tester")
+                .unwrap();
+        }
+        storage.ensure_blocked_cache_fresh().unwrap();
+        assert_eq!(persisted_blocked_cache(&storage).len(), 2);
+
+        let updates: Vec<_> = ids
+            .into_iter()
+            .map(|id| {
+                (
+                    id,
+                    IssueUpdate {
+                        status: Some(Status::Closed),
+                        ..IssueUpdate::default()
+                    },
+                )
+            })
+            .collect();
+        storage
+            .update_issues_atomically(&updates, "tester")
+            .unwrap();
+        assert!(persisted_blocked_cache(&storage).is_empty());
+        assert!(!storage.blocked_cache_marked_stale().unwrap());
+        assert!(storage.get_blockers("bd-first").unwrap().is_empty());
+        assert!(storage.get_blockers("bd-last").unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_failed_incremental_cache_refresh_preserves_close_and_stale_rows() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        for id in ["bd-a", "bd-b", "bd-dependent"] {
+            storage
+                .create_issue(
+                    &make_issue(id, id, Status::Open, 2, None, Utc::now(), None),
+                    "tester",
+                )
+                .unwrap();
+        }
+        for blocker in ["bd-a", "bd-b"] {
+            storage
+                .add_dependency("bd-dependent", blocker, "blocks", "tester")
+                .unwrap();
+        }
+        storage.ensure_blocked_cache_fresh().unwrap();
+        // A real SQL failure AFTER selective DELETE: inserts name blocked_at.
+        // Full post-commit repair will also fail, exercising durable staleness.
+        storage
+            .conn
+            .execute("ALTER TABLE blocked_issues_cache RENAME COLUMN blocked_at TO unavailable_at")
+            .unwrap();
+        storage
+            .update_issue(
+                "bd-a",
+                &IssueUpdate {
+                    status: Some(Status::Closed),
+                    ..IssueUpdate::default()
+                },
+                "tester",
+            )
+            .unwrap();
+        assert_eq!(
+            storage.get_issue("bd-a").unwrap().unwrap().status,
+            Status::Closed
+        );
+        assert!(storage.blocked_cache_marked_stale().unwrap());
+        assert!(SqliteStorage::foreign_keys_enabled(&storage.conn).unwrap());
+        let rows = storage
+            .conn
+            .query("SELECT blocked_by FROM blocked_issues_cache")
+            .unwrap();
+        assert_eq!(
+            rows.len(),
+            1,
+            "failed cache writes must roll back their DELETEs"
+        );
+        assert_eq!(
+            rows[0].get(0).and_then(SqliteValue::as_text),
+            Some(r#"["bd-a:open","bd-b:open"]"#)
+        );
+        assert_eq!(storage.get_blockers("bd-dependent").unwrap(), vec!["bd-b"]);
+        let events = storage
+            .conn
+            .query("SELECT actor FROM events WHERE issue_id = 'bd-a' AND event_type = 'closed'")
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].get(0).and_then(SqliteValue::as_text),
+            Some("tester")
+        );
+        storage
+            .conn
+            .execute("ALTER TABLE blocked_issues_cache RENAME COLUMN unavailable_at TO blocked_at")
+            .unwrap();
+        assert!(storage.ensure_blocked_cache_fresh().unwrap());
+        let rows = storage
+            .conn
+            .query("SELECT blocked_by FROM blocked_issues_cache")
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].get(0).and_then(SqliteValue::as_text),
+            Some(r#"["bd-b:open"]"#)
+        );
+    }
+
+    #[test]
+    fn test_status_and_type_batch_refreshes_unrelated_epic_rollup() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        for id in ["bd-a", "bd-parent", "bd-child"] {
+            storage
+                .create_issue(
+                    &make_issue(id, id, Status::Open, 2, None, Utc::now(), None),
+                    "tester",
+                )
+                .unwrap();
+        }
+        storage
+            .set_parent("bd-child", Some("bd-parent"), "tester")
+            .unwrap();
+        assert!(!storage.blocked_cache_marked_stale().unwrap());
+        for (status, issue_type, expected) in [
+            (
+                Status::Closed,
+                IssueType::Epic,
+                Some(r#"["bd-child:child-open"]"#),
+            ),
+            (Status::Open, IssueType::Task, None),
+        ] {
+            storage
+                .update_issues_atomically(
+                    &[
+                        (
+                            "bd-a".to_string(),
+                            IssueUpdate {
+                                status: Some(status),
+                                ..IssueUpdate::default()
+                            },
+                        ),
+                        (
+                            "bd-parent".to_string(),
+                            IssueUpdate {
+                                issue_type: Some(issue_type),
+                                ..IssueUpdate::default()
+                            },
+                        ),
+                    ],
+                    "tester",
+                )
+                .unwrap();
+            let rows = storage
+                .conn
+                .query("SELECT blocked_by FROM blocked_issues_cache WHERE issue_id = 'bd-parent'")
+                .unwrap();
+            assert_eq!(rows.len(), usize::from(expected.is_some()));
+            assert_eq!(
+                rows.first()
+                    .and_then(|row| row.get(0))
+                    .and_then(SqliteValue::as_text),
+                expected
+            );
+            assert!(!storage.blocked_cache_marked_stale().unwrap());
+        }
+    }
+
     #[test]
     fn test_update_issue_skip_cache_rebuild_marks_cache_stale_reads_compute_in_memory() {
         let temp_dir = TempDir::new().unwrap();
@@ -29976,6 +30880,9 @@ mod tests {
             .add_dependency("bd-unrelated", "bd-unrelated-blocker", "blocks", "tester")
             .unwrap();
 
+        storage.ensure_blocked_cache_fresh().unwrap();
+        storage.conn.execute("UPDATE blocked_issues_cache SET blocked_at = '2000-01-01' WHERE issue_id = 'bd-unrelated'").unwrap();
+
         assert!(storage.is_blocked("bd-parent").unwrap());
         assert!(storage.is_blocked("bd-parent.1").unwrap());
         assert!(storage.is_blocked("bd-parent.2").unwrap());
@@ -29994,6 +30901,31 @@ mod tests {
 
         let seed_ids = HashSet::from(["bd-parent.1".to_string()]);
         SqliteStorage::incremental_blocked_cache_update(&storage.conn, &seed_ids).unwrap();
+
+        assert!(!storage.blocked_cache_marked_stale().unwrap());
+        assert_eq!(
+            persisted_blocked_cache(&storage),
+            vec![
+                (
+                    "bd-parent".to_string(),
+                    r#"["bd-parent.1:child-open","bd-parent.2:child-open"]"#.to_string()
+                ),
+                (
+                    "bd-unrelated".to_string(),
+                    r#"["bd-unrelated-blocker:open"]"#.to_string()
+                ),
+            ]
+        );
+        let untouched = storage
+            .conn
+            .query_row(
+                "SELECT blocked_at FROM blocked_issues_cache WHERE issue_id = 'bd-unrelated'",
+            )
+            .unwrap();
+        assert_eq!(
+            untouched.get(0).and_then(SqliteValue::as_text),
+            Some("2000-01-01")
+        );
 
         let parent_blockers = storage.get_blockers("bd-parent").unwrap();
         assert_eq!(
@@ -37186,8 +38118,6 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    #[ignore = "carried red from the stranded sync-safety workstream (failed identically on its own \
-                pre-merge snapshot); tracked for completion by the owning workstream"]
     fn write_transaction_reports_post_commit_authority_loss_without_retrying() {
         let dir = TempDir::new().unwrap();
         let beads_dir = dir.path().join(".beads");
@@ -37228,14 +38158,12 @@ mod tests {
         let structured = crate::error::StructuredError::from_error(&error);
         assert!(!structured.retryable);
         assert_eq!(structured.code.exit_code(), 6);
-        assert_eq!(
-            structured
-                .context
-                .as_ref()
-                .and_then(|context| context.get("committed"))
-                .and_then(serde_json::Value::as_bool),
-            Some(true)
-        );
+        let context = structured.context.as_ref().expect("commit evidence");
+        assert_eq!(context["primary_commit_state"], "committed_unwitnessed");
+        assert_eq!(context["primary_committed"], true);
+        assert_eq!(context["primary_witnessed"], false);
+        assert_eq!(context["requires_reconciliation"], true);
+        assert_eq!(context["retryable"], false);
         let error = error.to_string();
         assert!(
             error.contains("write transaction committed, but database authority changed"),
@@ -37245,10 +38173,14 @@ mod tests {
             error.contains("reconcile committed state before retrying"),
             "{error}"
         );
+        // The displaced connection fails closed. The committed WAL stays at
+        // the original path and replays over the hook's byte-identical copy.
+        drop(storage);
+        let reopened = SqliteStorage::open(&db_path).unwrap();
         assert_eq!(
-            storage.get_metadata("postcommit_exclusive").unwrap(),
+            reopened.get_metadata("postcommit_exclusive").unwrap(),
             Some("committed".to_string()),
-            "the connection's displaced inode must retain the committed mutation"
+            "the committed mutation must survive in the WAL at the database path"
         );
     }
 
